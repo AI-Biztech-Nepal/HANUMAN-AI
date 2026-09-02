@@ -34,6 +34,11 @@
   }
   header.topbar h1 { font-size:16px; font-weight:600; letter-spacing:-.2px; }
   header.topbar .co { color:var(--muted); font-size:12.5px; margin-top:1px; }
+  header.topbar .signout {
+    margin:0 0 0 auto; width:auto; padding:7px 13px; font-size:12.5px; font-weight:500;
+    background:transparent; color:var(--muted); border:1px solid var(--border); border-radius:9px;
+  }
+  header.topbar .signout:hover { color:var(--text); border-color:var(--muted); }
 
   .page { display:none; padding:2px 16px 24px; animation:fadein .18s ease; }
   .page.active { display:block; }
@@ -90,9 +95,10 @@
   }
   .login-title { text-align:center; font-size:20px; font-weight:700; margin-bottom:6px; letter-spacing:-.3px; }
   .login-sub { text-align:center; font-size:13.5px; color:var(--muted); line-height:1.55; margin-bottom:26px; padding:0 8px; }
-  #loginStatus { font-size:13px; min-height:18px; margin-top:10px; text-align:center; transition:color 150ms ease; }
-  #loginStatus.err { color:var(--danger); }
-  #loginStatus.ok { color:var(--ok); }
+  #loginStatus, #inviteStatus { font-size:13px; min-height:18px; margin-top:10px; text-align:center; transition:color 150ms ease; }
+  #loginStatus.err, #inviteStatus.err { color:var(--danger); }
+  #loginStatus.ok, #inviteStatus.ok { color:var(--ok); }
+  .login-hint { font-size:12.5px; color:var(--muted); text-align:center; margin-top:14px; line-height:1.5; }
 
   /* ---------- stats row ---------- */
   .stats-row { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:14px; }
@@ -189,20 +195,42 @@
 <header class="topbar" id="topbar" style="display:none">
   <div class="logo">📞</div>
   <div><h1>hanuman.ai</h1><div class="co" id="coName"></div></div>
+  <button class="signout" id="signoutBtn" onclick="logout()" title="Sign out">Sign out</button>
 </header>
 
 <!-- LOGIN -->
 <div class="page active" id="page-login">
   <div class="login-logo">📞</div>
   <div class="login-title">hanuman.ai</div>
-  <div class="login-sub">Sign in with the access key hanuman.ai gave you.
-    Your AI agent answers business calls and collects leads — manage everything here.</div>
+  <div class="login-sub">Sign in to manage your AI agent.
+    It answers your business calls and collects leads — see everything here.</div>
   <div class="card">
-    <label>Access key</label>
-    <input id="loginKey" type="password" placeholder="tk_..." autocomplete="off" autocapitalize="off"
+    <label>Email</label>
+    <input id="loginEmail" type="email" placeholder="you@company.com.np" autocomplete="username"
+           autocapitalize="off" onkeydown="if(event.key==='Enter')$('loginPassword').focus()">
+    <label>Password</label>
+    <input id="loginPassword" type="password" placeholder="Your password" autocomplete="current-password"
            onkeydown="if(event.key==='Enter')login()">
     <button id="loginBtn" onclick="login()">Sign in</button>
     <div id="loginStatus"></div>
+    <div class="login-hint">No account yet? Your hanuman.ai contact sends you an invite link.</div>
+  </div>
+</div>
+
+<!-- SET PASSWORD (invite link) -->
+<div class="page" id="page-invite">
+  <div class="login-logo">🔑</div>
+  <div class="login-title">Set your password</div>
+  <div class="login-sub" id="inviteSub">Checking your invite…</div>
+  <div class="card" id="inviteCard" style="display:none">
+    <label>Password</label>
+    <input id="invPassword" type="password" placeholder="At least 8 characters"
+           autocomplete="new-password" onkeydown="if(event.key==='Enter')$('invPassword2').focus()">
+    <label>Confirm password</label>
+    <input id="invPassword2" type="password" placeholder="Type it again"
+           autocomplete="new-password" onkeydown="if(event.key==='Enter')acceptInvite()">
+    <button id="invBtn" onclick="acceptInvite()">Set password &amp; sign in</button>
+    <div id="inviteStatus"></div>
   </div>
 </div>
 
@@ -279,17 +307,24 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let KEY = localStorage.getItem('tenantKey') || '';
 let ws = null;
 let awaitingReply = false;
 
-const hdrs = () => ({ 'Content-Type':'application/json', 'X-Tenant-Key': KEY });
+// Auth is a httpOnly session cookie set by /auth/login — the browser attaches
+// it automatically and JS can't read it, so nothing sensitive lives in
+// localStorage any more.
+const hdrs = () => ({ 'Content-Type':'application/json' });
 
 async function api(path, opts={}) {
-  const r = await fetch(path, { headers: hdrs(), ...opts });
-  if (r.status === 401) { logout(); throw new Error('unauthorized'); }
-  if (!r.ok) throw new Error(await r.text());
+  const r = await fetch(path, { headers: hdrs(), credentials:'same-origin', ...opts });
+  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  if (!r.ok) throw new Error(await errText(r));
   return r.json();
+}
+
+async function errText(r) {
+  try { const j = await r.json(); return j.detail || r.statusText; }
+  catch(e) { return r.statusText; }
 }
 
 function go(page) {
@@ -301,30 +336,66 @@ function go(page) {
 }
 
 async function login() {
-  const key = $('loginKey').value.trim();
-  if (!key) return;
-  KEY = key;
-  $('loginBtn').disabled = true; $('loginBtn').textContent = 'Signing in…';
+  const email = $('loginEmail').value.trim();
+  const password = $('loginPassword').value;
   const st = $('loginStatus'); st.className=''; st.textContent='';
+  if (!email || !password) {
+    st.className='err'; st.textContent='Enter your email and password.'; return;
+  }
+  $('loginBtn').disabled = true; $('loginBtn').textContent = 'Signing in…';
   try {
-    const me = await api('/portal/me');
-    localStorage.setItem('tenantKey', KEY);
-    enter(me);
+    const r = await fetch('/auth/login', {
+      method:'POST', headers: hdrs(), credentials:'same-origin',
+      body: JSON.stringify({ email, password }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    $('loginPassword').value = '';
+    enter(await api('/portal/me'));
   } catch(e) {
     st.className = 'err';
-    st.textContent = 'Invalid key — check and try again.';
+    // Surface the server's message: it distinguishes bad credentials from
+    // a lockout, and "try again in N seconds" is only useful if shown.
+    st.textContent = e.message || 'Could not sign in.';
   } finally {
     $('loginBtn').disabled = false; $('loginBtn').textContent = 'Sign in';
   }
 }
 
-function logout() {
-  localStorage.removeItem('tenantKey'); KEY='';
+async function acceptInvite() {
+  const token = new URLSearchParams(location.search).get('invite');
+  const p1 = $('invPassword').value, p2 = $('invPassword2').value;
+  const st = $('inviteStatus'); st.className=''; st.textContent='';
+  if (p1 !== p2) { st.className='err'; st.textContent='Those passwords do not match.'; return; }
+  if (p1.length < 8) { st.className='err'; st.textContent='Use at least 8 characters.'; return; }
+  $('invBtn').disabled = true; $('invBtn').textContent = 'Setting…';
+  try {
+    const r = await fetch('/auth/invite/' + encodeURIComponent(token), {
+      method:'POST', headers: hdrs(), credentials:'same-origin',
+      body: JSON.stringify({ password: p1 }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    // Drop the token from the URL so it isn't re-used, bookmarked or shared.
+    history.replaceState({}, '', '/portal');
+    enter(await api('/portal/me'));
+  } catch(e) {
+    st.className='err'; st.textContent = e.message || 'Could not set your password.';
+  } finally {
+    $('invBtn').disabled = false; $('invBtn').textContent = 'Set password & sign in';
+  }
+}
+
+function showLogin() {
   if (ws) { try{ws.close()}catch(e){} ws=null; }
   $('nav').style.display='none';
   $('topbar').style.display='none';
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   $('page-login').classList.add('active');
+}
+
+async function logout() {
+  try { await fetch('/auth/logout', { method:'POST', credentials:'same-origin' }); }
+  catch(e) { /* clearing the session locally still matters if the call fails */ }
+  showLogin();
 }
 
 function enter(me) {
@@ -417,7 +488,9 @@ function startChat() {
   setConn('connecting');
   const proto = location.protocol==='https:'?'wss':'ws';
   ws = new WebSocket(`${proto}://${location.host}/portal/ws/test-chat`);
-  ws.onopen = () => { ws.send(KEY); setConn('live'); showTyping(); };
+  // The session cookie rides along with the upgrade request; the server still
+  // reads one opening message, so send an empty one to keep the handshake.
+  ws.onopen = () => { ws.send(''); setConn('live'); showTyping(); };
   ws.onmessage = ev => { hideTyping(); addMsg(ev.data, 'agent'); };
   ws.onclose = () => { ws=null; setConn('dead'); };
   ws.onerror = () => setConn('dead');
@@ -449,7 +522,31 @@ function addMsg(text, who) {
 function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // auto-login if key saved
-if (KEY) api('/portal/me').then(enter).catch(()=>logout());
+// Boot: an invite link goes to the set-password screen; otherwise try to
+// resume an existing session, and fall back to the sign-in form.
+(async function boot() {
+  const invite = new URLSearchParams(location.search).get('invite');
+  if (invite) {
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    $('page-invite').classList.add('active');
+    try {
+      const r = await fetch('/auth/invite/' + encodeURIComponent(invite),
+                            { credentials:'same-origin' });
+      if (!r.ok) throw new Error(await errText(r));
+      const inv = await r.json();
+      $('inviteSub').textContent =
+        `Choose a password for ${inv.email}${inv.company_name ? ' at ' + inv.company_name : ''}.`;
+      $('inviteCard').style.display = '';
+      $('invPassword').focus();
+    } catch(e) {
+      $('inviteSub').textContent =
+        'This invite link is invalid or has expired. Ask your hanuman.ai contact for a new one.';
+    }
+    return;
+  }
+  try { enter(await api('/portal/me')); }
+  catch(e) { showLogin(); }
+})();
 </script>
 </body>
 </html>

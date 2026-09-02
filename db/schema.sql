@@ -30,6 +30,32 @@ CREATE TABLE agent_configs (
   hours       JSONB
 );
 
+-- Portal logins. Invite-based: an operator creates the row, the customer sets
+-- the password. Tokens are stored hashed so a dump grants nothing.
+CREATE TABLE users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  email         TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'invited',    -- invited|active|suspended
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  last_login_at TIMESTAMPTZ
+);
+
+CREATE TABLE sessions (
+  token_hash TEXT PRIMARY KEY,                      -- sha256 of the cookie value
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE invites (
+  token_hash TEXT PRIMARY KEY,                      -- sha256 of the invite token
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at    TIMESTAMPTZ
+);
+
 CREATE TABLE calls (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id     UUID NOT NULL REFERENCES tenants(id),
@@ -68,3 +94,6 @@ CREATE TABLE do_not_call (
 
 CREATE INDEX ON calls (tenant_id, started_at DESC);
 CREATE INDEX ON leads (tenant_id, created_at DESC);
+CREATE INDEX ON users (tenant_id);
+CREATE INDEX ON sessions (user_id);
+CREATE INDEX ON sessions (expires_at);

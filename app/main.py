@@ -15,6 +15,16 @@ Admin API (header: X-Admin-Key = ADMIN_API_KEY from .env):
   GET             /admin/leads?tenant_id=
   GET/POST        /admin/dnc                 do-not-call list (checked before outbound dial)
   DELETE          /admin/dnc/{e164}
+  GET/POST        /admin/tenants/{id}/users  portal logins; POST returns a one-time invite link
+  POST            /admin/users/{id}/reissue-invite
+  DELETE          /admin/users/{id}
+
+Portal auth (customers sign in with email + password; no public signup):
+  POST            /auth/login                {"email","password"} → session cookie
+  POST            /auth/logout
+  GET             /auth/me
+  GET/POST        /auth/invite/{token}       check / accept an invite, sets first password
+  POST            /auth/password             {"current","new"}
 
 Dashboard: GET /admin  (simple HTML UI, same admin key)
 """
@@ -23,10 +33,12 @@ import json
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Cookie, FastAPI, Form, Header, HTTPException, WebSocket, WebSocketDisconnect,
+)
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 
-from . import agent, dnc, storage, tenants, usage, config
+from . import agent, auth, dnc, storage, tenants, usage, config
 
 app = FastAPI(title="hanuman.ai — AI Call Platform")
 
@@ -246,32 +258,189 @@ async def admin_dashboard():
 
 
 # ---------------------------------------------------- customer portal API
-# Auth: header X-Tenant-Key = the tenant's api_key (given at onboarding).
+# Two ways in, deliberately:
+#   - session cookie  → people, signed in with email + password (the portal UI)
+#   - X-Tenant-Key    → machines, using the tenant api_key (integrations)
 # Customers can see their own data and edit their own agent — nothing else.
 
 PORTAL_EDITABLE = {
     "agent_name", "language", "greeting", "facts", "questions", "transfer_to",
 }
 
+SESSION_COOKIE = "hanuman_session"
 
-def _require_tenant(x_tenant_key: str | None) -> tenants.TenantConfig:
-    cfg = tenants.get_by_api_key(x_tenant_key or "")
+
+def _tenant_for_session(token: str | None) -> tenants.TenantConfig | None:
+    user = auth.user_for_session(token or "")
+    if user is None:
+        return None
+    return tenants.get(user.tenant_id)
+
+
+def _require_tenant(
+    x_tenant_key: str | None,
+    session: str | None = None,
+) -> tenants.TenantConfig:
+    cfg = _tenant_for_session(session) if session else None
+    if cfg is None:
+        cfg = tenants.get_by_api_key(x_tenant_key or "")
     if cfg is None or cfg.status != "active":
-        raise HTTPException(status_code=401, detail="invalid tenant key")
+        raise HTTPException(status_code=401, detail="not signed in")
     return cfg
 
 
+def _set_session_cookie(response: Response, token: str) -> None:
+    # secure=True only when we know we're behind HTTPS — otherwise the cookie
+    # would be dropped on a plain-HTTP pilot box and nobody could sign in.
+    response.set_cookie(
+        SESSION_COOKIE, token,
+        max_age=auth.SESSION_TTL_DAYS * 24 * 3600,
+        httponly=True, samesite="lax",
+        secure=config.PUBLIC_BASE_URL.startswith("https://"),
+        path="/",
+    )
+
+
+# ------------------------------------------------------------ portal auth API
+
+@app.post("/auth/login")
+async def auth_login(body: dict):
+    try:
+        user, token = auth.login(body.get("email", ""), body.get("password", ""))
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    cfg = tenants.get(user.tenant_id)
+    if cfg is None or cfg.status != "active":
+        raise HTTPException(status_code=403, detail="this account's company is not active")
+    resp = JSONResponse({"user": user.to_dict(), "company_name": cfg.company_name})
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout(session: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
+    auth.logout(session or "")
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/auth/me")
+async def auth_me(session: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
+    user = auth.user_for_session(session or "")
+    if user is None:
+        raise HTTPException(status_code=401, detail="not signed in")
+    cfg = tenants.get(user.tenant_id)
+    return {"user": user.to_dict(),
+            "company_name": cfg.company_name if cfg else ""}
+
+
+@app.get("/auth/invite/{token}")
+async def auth_invite_peek(token: str):
+    """Check an invite link without consuming it, so the page can greet the
+    right person before they choose a password."""
+    user = auth.peek_invite(token)
+    if user is None:
+        raise HTTPException(status_code=404, detail="this invite link is invalid or has expired")
+    cfg = tenants.get(user.tenant_id)
+    return {"email": user.email,
+            "company_name": cfg.company_name if cfg else ""}
+
+
+@app.post("/auth/invite/{token}")
+async def auth_invite_accept(token: str, body: dict):
+    try:
+        user = auth.accept_invite(token, body.get("password", ""))
+        # Sign them straight in — a freshly set password is proof enough.
+        _, session_token = auth.login(user.email, body.get("password", ""))
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    resp = JSONResponse({"user": user.to_dict()})
+    _set_session_cookie(resp, session_token)
+    return resp
+
+
+@app.post("/auth/password")
+async def auth_change_password(
+    body: dict,
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    user = auth.user_for_session(session or "")
+    if user is None:
+        raise HTTPException(status_code=401, detail="not signed in")
+    try:
+        auth.change_password(user.user_id, body.get("current", ""), body.get("new", ""))
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # change_password drops every session, this one included — sign back in.
+    _, token = auth.login(user.email, body.get("new", ""))
+    resp = JSONResponse({"ok": True})
+    _set_session_cookie(resp, token)
+    return resp
+
+
+# ------------------------------------------- admin: portal user management
+
+@app.get("/admin/tenants/{tenant_id}/users")
+async def admin_list_users(tenant_id: str, x_admin_key: str | None = Header(default=None)):
+    _require_admin(x_admin_key)
+    return auth.list_users(tenant_id)
+
+
+@app.post("/admin/tenants/{tenant_id}/users")
+async def admin_create_user(
+    tenant_id: str, body: dict, x_admin_key: str | None = Header(default=None)
+):
+    """Create a portal login for a tenant. Returns a one-time invite link —
+    it is shown once and cannot be recovered, only reissued."""
+    _require_admin(x_admin_key)
+    if tenants.get(tenant_id) is None:
+        raise HTTPException(404, "tenant not found")
+    try:
+        user, token = auth.create_user(tenant_id, body.get("email", ""))
+    except auth.AuthError as exc:
+        raise HTTPException(400, str(exc))
+    base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
+    return {"user": user.to_dict(), "invite_url": f"{base}/portal?invite={token}"}
+
+
+@app.post("/admin/users/{user_id}/reissue-invite")
+async def admin_reissue_invite(user_id: str, x_admin_key: str | None = Header(default=None)):
+    """Password reset, operator-style: issue a fresh invite link."""
+    _require_admin(x_admin_key)
+    try:
+        token = auth.reissue_invite(user_id)
+    except auth.AuthError as exc:
+        raise HTTPException(404, str(exc))
+    base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
+    return {"invite_url": f"{base}/portal?invite={token}"}
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, x_admin_key: str | None = Header(default=None)):
+    _require_admin(x_admin_key)
+    auth.delete_user(user_id)
+    return {"deleted": user_id}
+
+
 @app.get("/portal/me")
-async def portal_me(x_tenant_key: str | None = Header(default=None)):
-    cfg = _require_tenant(x_tenant_key)
+async def portal_me(
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    cfg = _require_tenant(x_tenant_key, session)
     d = cfg.to_dict()
     d.pop("api_key", None)   # never echo the key back
     return d
 
 
 @app.put("/portal/me")
-async def portal_update(body: dict, x_tenant_key: str | None = Header(default=None)):
-    cfg = _require_tenant(x_tenant_key)
+async def portal_update(
+    body: dict,
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    cfg = _require_tenant(x_tenant_key, session)
     for k, v in body.items():
         if k in PORTAL_EDITABLE:
             setattr(cfg, k, v)
@@ -282,14 +451,20 @@ async def portal_update(body: dict, x_tenant_key: str | None = Header(default=No
 
 
 @app.get("/portal/leads")
-async def portal_leads(x_tenant_key: str | None = Header(default=None)):
-    cfg = _require_tenant(x_tenant_key)
+async def portal_leads(
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    cfg = _require_tenant(x_tenant_key, session)
     return JSONResponse(storage.list_leads(tenant_id=cfg.tenant_id))
 
 
 @app.get("/portal/usage")
-async def portal_usage(x_tenant_key: str | None = Header(default=None)):
-    cfg = _require_tenant(x_tenant_key)
+async def portal_usage(
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    cfg = _require_tenant(x_tenant_key, session)
     s = usage.summary(cfg.tenant_id)
     s["included_minutes"] = cfg.included_minutes
     return s
@@ -334,12 +509,19 @@ async def admin_test_call(body: dict, x_admin_key: str | None = Header(default=N
 
 @app.websocket("/portal/ws/test-chat")
 async def portal_test_chat(ws: WebSocket):
-    """In-browser test call: first message is the tenant api_key, then text turns."""
+    """In-browser test call, then text turns.
+
+    Authenticates from the session cookie the browser sends with the upgrade
+    request. The first message is still read and accepted as a tenant api_key
+    so existing integrations keep working; signed-in browsers send "".
+    """
     await ws.accept()
     key = await ws.receive_text()
-    cfg = tenants.get_by_api_key(key.strip())
+    cfg = _tenant_for_session(ws.cookies.get(SESSION_COOKIE))
     if cfg is None:
-        await ws.send_text("[error] invalid key")
+        cfg = tenants.get_by_api_key(key.strip())
+    if cfg is None or cfg.status != "active":
+        await ws.send_text("[error] not signed in")
         await ws.close()
         return
     session = agent.CallSession(

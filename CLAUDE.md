@@ -16,8 +16,8 @@ python test_call.py [tenant_id]
 python -m py_compile app/*.py media/voice_bridge.py test_call.py
 ```
 
-There is no formal test suite yet — adding pytest coverage is a welcome task.
-Until then, verify changes with `py_compile` + a `fastapi.testclient` smoke script.
+Run the test suite with `pytest` (91 tests, SQLite-backed, no network). Every
+test gets a fresh DB via the `tmp_db` fixture in `tests/conftest.py`.
 
 ## Architecture (read docs/ARCHITECTURE.md for the full picture)
 
@@ -27,6 +27,9 @@ Until then, verify changes with `py_compile` + a `fastapi.testclient` smoke scri
   small per-tenant block. Default model: Haiku (cost = the business margin; don't
   switch to Sonnet globally).
 - `app/tenants.py` — tenant CRUD, phone-number→tenant routing, portal api_keys (`tk_...`).
+- `app/auth.py` — portal logins: users, scrypt password hashing, sessions, invites.
+  Stdlib crypto only, no auth dependency. Session and invite tokens are stored
+  **hashed** — never add a code path that writes or logs a raw token.
 - `app/main.py` — FastAPI. Three surfaces: Twilio webhooks (`/twilio/*`), generic
   text WebSocket (`/ws/chat`, for future Asterisk/SIP integration), admin API +
   customer portal API. Static UIs: `app/static/admin.html`, `app/static/portal.html`
@@ -41,6 +44,10 @@ Until then, verify changes with `py_compile` + a `fastapi.testclient` smoke scri
 - Every data query MUST be tenant-scoped. Never leak data across tenants.
 - Portal endpoints: customers may only edit fields in `PORTAL_EDITABLE` (main.py).
   Never expose `api_key`, `status`, `included_minutes` to portal writes.
+- Portal auth has two doors, both tenant-scoped: a session cookie (people, via
+  email + password) and `X-Tenant-Key` (machines/integrations). New portal
+  routes must accept both — take `session` and `x_tenant_key`, call
+  `_require_tenant`. There is no public signup; operators invite users.
 - Metering (`usage.record_call`) must never raise into call handling.
 - Agent speech style: short sentences, one question per turn, no markdown — it's spoken.
 - Platform-level agent rules that must never be removed: admits it's an AI when asked;
