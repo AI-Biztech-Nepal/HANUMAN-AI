@@ -30,6 +30,7 @@ Dashboard: GET /admin  (simple HTML UI, same admin key)
 """
 import asyncio
 import json
+import logging
 import uuid
 from pathlib import Path
 
@@ -38,7 +39,9 @@ from fastapi import (
 )
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 
-from . import agent, auth, dnc, storage, tenants, usage, config
+from . import agent, auth, dnc, storage, tenants, usage, voice, config
+
+log = logging.getLogger("hanuman")
 
 app = FastAPI(title="hanuman.ai — AI Call Platform")
 
@@ -534,6 +537,89 @@ async def portal_test_chat(ws: WebSocket):
         while not session.ended:
             user_text = await ws.receive_text()
             await ws.send_text(await asyncio.to_thread(agent.respond, session, user_text))
+        await ws.close()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.get("/portal/voice-status")
+async def portal_voice_status(
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    """Whether this host can run an in-browser voice call, so the portal can
+    hide the mic rather than offer a button that cannot work."""
+    _require_tenant(x_tenant_key, session)
+    state = await asyncio.to_thread(voice.status)
+    if state.get("available"):
+        # Load the models now, in the background, so the first spoken turn
+        # doesn't pay for it. Deliberately not awaited.
+        asyncio.create_task(asyncio.to_thread(voice.warmup))
+    return state
+
+
+@app.websocket("/portal/ws/voice")
+async def portal_voice_call(ws: WebSocket):
+    """A real voice conversation in the browser: mic audio in, spoken reply out.
+
+    Same agent and same speech pipeline the phone bridges use — this is the
+    telephony path with the browser standing in for the trunk.
+
+    Protocol, after the session cookie authenticates the upgrade:
+      server -> {"type":"say","text":...}  followed by the reply audio as one
+                binary frame (or {"type":"error"|"heard"|"ended"})
+      client -> one binary frame per utterance (webm/opus from MediaRecorder)
+    """
+    await ws.accept()
+    cfg = _tenant_for_session(ws.cookies.get(SESSION_COOKIE))
+    if cfg is None or cfg.status != "active":
+        await ws.send_json({"type": "error", "detail": "not signed in"})
+        await ws.close()
+        return
+
+    state = await asyncio.to_thread(voice.status)
+    if not state.get("available"):
+        await ws.send_json({"type": "error",
+                            "detail": f"voice is unavailable here — {state.get('reason', '')}"})
+        await ws.close()
+        return
+
+    lang = cfg.language if cfg.language in ("ne", "en") else None
+    session_obj = agent.CallSession(
+        call_id="portal-voice-" + str(uuid.uuid4())[:8],
+        caller_number="portal-test",     # keeps test calls out of billing
+        tenant=cfg,
+    )
+
+    async def say(text: str) -> None:
+        await ws.send_json({"type": "say", "text": text})
+        try:
+            await ws.send_bytes(await asyncio.to_thread(voice.speak, text, lang))
+        except Exception:                             # noqa: BLE001
+            # A failed synthesis must not end the call — the text is already
+            # on screen, so the conversation can continue without audio.
+            log.exception("speech synthesis failed")
+            await ws.send_json({"type": "error", "detail": "could not speak that reply"})
+
+    try:
+        await say(await asyncio.to_thread(agent.greeting, session_obj))
+        while not session_obj.ended:
+            audio = await ws.receive_bytes()
+            try:
+                heard = await asyncio.to_thread(voice.transcribe, audio, lang or "ne")
+            except Exception:                         # noqa: BLE001
+                log.exception("transcription failed")
+                await ws.send_json({"type": "error", "detail": "could not hear that"})
+                continue
+            if not heard:
+                # Whisper returns "" for silence and for its own hallucinations;
+                # asking again beats answering something nobody said.
+                await ws.send_json({"type": "heard", "text": "", "empty": True})
+                continue
+            await ws.send_json({"type": "heard", "text": heard})
+            await say(await asyncio.to_thread(agent.respond, session_obj, heard))
+        storage.save_session(session_obj)
+        await ws.send_json({"type": "ended"})
         await ws.close()
     except WebSocketDisconnect:
         pass

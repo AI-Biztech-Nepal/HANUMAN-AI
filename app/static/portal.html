@@ -100,6 +100,25 @@
   #loginStatus.ok, #inviteStatus.ok { color:var(--ok); }
   .login-hint { font-size:12.5px; color:var(--muted); text-align:center; margin-top:14px; line-height:1.5; }
 
+  /* ---------- voice call ---------- */
+  .head-btns { display:flex; gap:7px; flex-shrink:0; }
+  #voiceBar { display:flex; flex-direction:column; align-items:center; gap:12px; padding:20px 0 6px; }
+  #voiceBar .small { width:auto; padding:8px 16px; }
+  .mic-wrap { position:relative; width:76px; height:76px; display:flex; align-items:center; justify-content:center; }
+  .mic-wrap .mic {
+    width:60px; height:60px; border-radius:50%; background:var(--card); border:1px solid var(--border);
+    display:flex; align-items:center; justify-content:center; font-size:26px; position:relative; z-index:1;
+  }
+  .mic-ring { position:absolute; inset:0; border-radius:50%; border:2px solid transparent; transition:border-color .2s ease; }
+  /* Listening pulses, thinking spins, speaking glows — three states you can
+     read at a glance without looking at the label. */
+  .mic-wrap.listening .mic-ring { border-color:var(--ok); animation:pulse 1.3s ease-out infinite; }
+  .mic-wrap.thinking  .mic-ring { border-top-color:var(--muted); animation:spin .9s linear infinite; }
+  .mic-wrap.speaking  .mic-ring { border-color:#7c8cff; box-shadow:0 0 16px rgba(124,140,255,.45); }
+  @keyframes pulse { 0%{transform:scale(1);opacity:.9} 100%{transform:scale(1.35);opacity:0} }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  .mic-state { font-size:13px; color:var(--muted); min-height:18px; text-align:center; }
+
   /* ---------- stats row ---------- */
   .stats-row { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:14px; }
   .stat {
@@ -284,10 +303,18 @@
         <div class="card-title">Test your agent</div>
         <div id="chatMeta"><span class="connDot dead" id="connDot"></span><span id="connLabel">Connecting…</span></div>
       </div>
-      <button class="small ghost" onclick="startChat()">↻ New test call</button>
+      <div class="head-btns">
+        <button class="small ghost" id="voiceBtn" onclick="toggleVoice()" style="display:none">🎙 Voice call</button>
+        <button class="small ghost" onclick="startChat()">↻ New test call</button>
+      </div>
     </div>
     <div id="chatLog"></div>
-    <div class="chatRow">
+    <div id="voiceBar" style="display:none">
+      <div class="mic-wrap"><div class="mic-ring" id="micRing"></div><div class="mic">🎙</div></div>
+      <div class="mic-state" id="micState">Starting…</div>
+      <button class="small ghost" onclick="stopVoice()">End call</button>
+    </div>
+    <div class="chatRow" id="chatRow">
       <input id="chatInput" placeholder="Say something… (नेपाली ठिक छ)"
              onkeydown="if(event.key==='Enter')sendChat()">
       <button class="send" onclick="sendChat()">➤</button>
@@ -328,11 +355,14 @@ async function errText(r) {
 }
 
 function go(page) {
+  // Navigating away from the test tab must release the mic — a page that
+  // keeps recording in the background is the fastest way to lose trust.
+  if (page !== 'test' && vws) stopVoice();
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   $('page-'+page).classList.add('active');
   document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active', a.dataset.page===page));
   if (page==='leads') loadLeads();
-  if (page==='test' && !ws) startChat();
+  if (page==='test' && !ws && !vws) startChat();
 }
 
 async function login() {
@@ -408,6 +438,7 @@ function enter(me) {
   $('a_transfer_to').value = me.transfer_to||'';
   $('nav').style.display='flex';
   $('topbar').style.display='flex';
+  checkVoice();
   go('leads');
 }
 
@@ -520,6 +551,149 @@ function addMsg(text, who) {
 }
 
 function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* ------------------------------------------------------------ voice call
+   A real spoken conversation: mic → Whisper → agent → Piper → speaker,
+   the same pipeline the phone bridges use. One utterance per turn, ended
+   by silence, because transcription is far too slow to stream. */
+
+let vws = null, vstream = null, vrec = null, vaudio = null;
+let vactx = null, vanalyser = null, vspeaking = false;
+
+const SILENCE_MS = 900;      // quiet this long ends your turn
+const MIN_SPEECH_MS = 300;   // ignore coughs and clicks
+const MAX_TURN_MS = 15000;   // safety valve for a stuck-open mic
+const RMS_THRESHOLD = 0.015; // ~ the 500/32768 the telephony VAD uses
+
+function micState(cls, text) {
+  const w = document.querySelector('.mic-wrap');
+  if (w) w.className = 'mic-wrap ' + (cls || '');
+  $('micState').textContent = text || '';
+}
+
+async function toggleVoice() {
+  if (vws) { stopVoice(); return; }
+  try {
+    vstream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount:1, echoCancellation:true, noiseSuppression:true },
+    });
+  } catch(e) {
+    addMsg('Microphone permission denied — allow it in your browser to make a voice call.', 'agent');
+    return;
+  }
+  if (ws) { try{ws.close()}catch(e){} ws=null; }
+  $('chatLog').innerHTML = '';
+  $('chatRow').style.display = 'none';
+  $('voiceBar').style.display = 'flex';
+  $('voiceBtn').textContent = '■ Stop voice';
+  micState('thinking', 'Connecting…');
+  setConn('connecting');
+
+  const proto = location.protocol==='https:'?'wss':'ws';
+  vws = new WebSocket(`${proto}://${location.host}/portal/ws/voice`);
+  vws.binaryType = 'arraybuffer';
+  vws.onopen = () => setConn('live');
+  vws.onmessage = onVoiceMessage;
+  vws.onclose = () => { setConn('dead'); cleanupVoice(); };
+  vws.onerror = () => { setConn('dead'); micState('', 'Connection problem.'); };
+}
+
+function onVoiceMessage(ev) {
+  if (typeof ev.data !== 'string') { playReply(ev.data); return; }
+  const m = JSON.parse(ev.data);
+  if (m.type === 'say')    { addMsg(m.text, 'agent'); micState('speaking', 'Agent speaking…'); }
+  else if (m.type === 'heard') {
+    if (m.empty) { micState('listening', "Didn't catch that — go ahead."); listen(); }
+    else addMsg(m.text, 'user');
+  }
+  else if (m.type === 'ended') { micState('', 'Call ended.'); stopVoice(); }
+  else if (m.type === 'error') { addMsg('[' + m.detail + ']', 'agent'); micState('', m.detail); }
+}
+
+function playReply(buf) {
+  const blob = new Blob([buf], { type:'audio/wav' });
+  vaudio = new Audio(URL.createObjectURL(blob));
+  vspeaking = true;
+  // Only start listening once the agent has finished, or the mic would
+  // record the agent's own voice through the speakers.
+  vaudio.onended = () => { vspeaking = false; listen(); };
+  vaudio.onerror  = () => { vspeaking = false; listen(); };
+  vaudio.play().catch(() => { vspeaking = false; listen(); });
+}
+
+async function listen() {
+  if (!vws || vws.readyState !== 1 || vspeaking) return;
+  micState('listening', 'Listening — speak now');
+
+  const chunks = [];
+  vrec = new MediaRecorder(vstream);
+  vrec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  vrec.onstop = () => {
+    micState('thinking', 'Thinking…');
+    const blob = new Blob(chunks, { type: vrec.mimeType || 'audio/webm' });
+    if (vws && vws.readyState === 1 && blob.size > 0) blob.arrayBuffer().then(b => vws.send(b));
+  };
+  vrec.start();
+
+  // Energy-based endpointing, mirroring the telephony bridge's VAD.
+  if (!vactx) {
+    vactx = new (window.AudioContext || window.webkitAudioContext)();
+    vanalyser = vactx.createAnalyser();
+    vanalyser.fftSize = 512;
+    vactx.createMediaStreamSource(vstream).connect(vanalyser);
+  }
+  const data = new Float32Array(vanalyser.fftSize);
+  const started = Date.now();
+  let spokeAt = 0, quietSince = 0;
+
+  (function tick() {
+    if (!vrec || vrec.state !== 'recording') return;
+    vanalyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+    const now = Date.now();
+
+    if (rms >= RMS_THRESHOLD) { if (!spokeAt) spokeAt = now; quietSince = 0; }
+    else if (spokeAt && now - spokeAt > MIN_SPEECH_MS) {
+      if (!quietSince) quietSince = now;
+      // Only count silence after real speech, so hesitation before starting
+      // doesn't end the turn instantly.
+      if (now - quietSince >= SILENCE_MS) { try { vrec.stop(); } catch(e){} return; }
+    }
+    if (now - started > MAX_TURN_MS) { try { vrec.stop(); } catch(e){} return; }
+    requestAnimationFrame(tick);
+  })();
+}
+
+function stopVoice() {
+  if (vws) { try{vws.close()}catch(e){} vws=null; }
+  cleanupVoice();
+}
+
+function cleanupVoice() {
+  if (vrec && vrec.state === 'recording') { try{vrec.stop()}catch(e){} }
+  vrec = null;
+  if (vaudio) { try{vaudio.pause()}catch(e){} vaudio=null; }
+  vspeaking = false;
+  if (vstream) { vstream.getTracks().forEach(t=>t.stop()); vstream=null; }
+  if (vactx) { try{vactx.close()}catch(e){} vactx=null; vanalyser=null; }
+  $('voiceBar').style.display='none';
+  $('chatRow').style.display='';
+  $('voiceBtn').textContent='🎙 Voice call';
+}
+
+async function checkVoice() {
+  try {
+    const s = await api('/portal/voice-status');
+    // Hide the button rather than offer one that cannot work: voice needs
+    // piper + whisper on the host actually serving this page.
+    if (s.available && navigator.mediaDevices && window.MediaRecorder) {
+      $('voiceBtn').style.display = '';
+      $('voiceBtn').title = 'Speech model: ' + (s.stt_model || '');
+    }
+  } catch(e) { /* leave the button hidden */ }
+}
 
 // auto-login if key saved
 // Boot: an invite link goes to the set-password screen; otherwise try to

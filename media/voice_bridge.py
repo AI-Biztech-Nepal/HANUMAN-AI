@@ -120,8 +120,15 @@ def _get_voice(model_path: str):
     return voice
 
 
-def synthesize(text: str, out_wav: str, voice: str = PIPER_VOICE) -> str:
-    """Text → WAV file via Piper, resampled to 8kHz. Returns out_wav path."""
+def synthesize(text: str, out_wav: str, voice: str = PIPER_VOICE,
+               telephony: bool = True) -> str:
+    """Text → WAV file via Piper. Returns out_wav path.
+
+    telephony=True resamples to 8kHz for Asterisk/Twilio, which is the only
+    rate those endpoints accept. Browser playback should pass False — 8kHz
+    audio sounds noticeably worse through laptop speakers and there is no
+    reason to downsample for it.
+    """
     try:
         with wave.open(out_wav, "wb") as w:
             _get_voice(voice).synthesize_wav(text, w)
@@ -136,7 +143,8 @@ def synthesize(text: str, out_wav: str, voice: str = PIPER_VOICE) -> str:
             check=True,
             capture_output=True,
         )
-    _resample_to_telephony_rate(out_wav)
+    if telephony:
+        _resample_to_telephony_rate(out_wav)
     return out_wav
 
 
