@@ -5,6 +5,8 @@ anthropic>=0.40
 python-dotenv>=1.0
 websockets>=12.0
 httpx>=0.27
+# agent.py builds its Anthropic client on httpx2 to disable connection reuse
+httpx2>=2.12
 pydantic>=2.7
 # Telephony (Twilio path — optional, install if using Twilio)
 twilio>=9.0

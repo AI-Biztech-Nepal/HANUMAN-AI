@@ -65,7 +65,7 @@ from app import config, tenants                          # noqa: E402
 log = logging.getLogger("asterisk_bridge")
 
 SAMPLE_RATE = 16000
-AGENT_WS_URL = "ws://127.0.0.1:8000/ws/chat"
+AGENT_WS_URL = config.AGENT_WS_URL
 
 # VAD tuning — energy-threshold silence detection, no external VAD dependency.
 RMS_SPEECH_THRESHOLD = 500       # out of 32768 full-scale

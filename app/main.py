@@ -18,6 +18,7 @@ Admin API (header: X-Admin-Key = ADMIN_API_KEY from .env):
 
 Dashboard: GET /admin  (simple HTML UI, same admin key)
 """
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -129,12 +130,15 @@ async def ws_chat(ws: WebSocket):
     )
     SESSIONS[session.call_id] = session
     try:
-        await ws.send_text(agent.greeting(session))
+        # agent.* calls block on a synchronous Anthropic HTTP request — running them
+        # inline would freeze this connection's event loop turn (and its keepalive
+        # ping/pong) for the call's full duration, so offload to a thread.
+        await ws.send_text(await asyncio.to_thread(agent.greeting, session))
         if pending_user_text and not session.ended:
-            await ws.send_text(agent.respond(session, pending_user_text))
+            await ws.send_text(await asyncio.to_thread(agent.respond, session, pending_user_text))
         while not session.ended:
             user_text = await ws.receive_text()
-            await ws.send_text(agent.respond(session, user_text))
+            await ws.send_text(await asyncio.to_thread(agent.respond, session, user_text))
         storage.save_session(session)
         await ws.close()
     except WebSocketDisconnect:
@@ -344,9 +348,10 @@ async def portal_test_chat(ws: WebSocket):
         tenant=cfg,
     )
     try:
-        await ws.send_text(agent.greeting(session))
+        await ws.send_text(await asyncio.to_thread(agent.greeting, session))
         while not session.ended:
-            await ws.send_text(agent.respond(session, await ws.receive_text()))
+            user_text = await ws.receive_text()
+            await ws.send_text(await asyncio.to_thread(agent.respond, session, user_text))
         await ws.close()
     except WebSocketDisconnect:
         pass

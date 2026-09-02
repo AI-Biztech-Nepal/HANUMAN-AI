@@ -32,3 +32,6 @@ ARI_PASSWORD = os.getenv("ARI_PASSWORD", "")
 ARI_APP_NAME = os.getenv("ARI_APP_NAME", "hanuman")
 EXTERNAL_MEDIA_HOST = os.getenv("EXTERNAL_MEDIA_HOST", "127.0.0.1")
 ASTERISK_SOUNDS_DIR = os.getenv("ASTERISK_SOUNDS_DIR", "/var/lib/asterisk/sounds/custom")
+# Where the agent core's /ws/chat lives, from the bridge's perspective — override
+# when the bridge runs on a different host/VM than uvicorn (e.g. WSL vs. Windows).
+AGENT_WS_URL = os.getenv("AGENT_WS_URL", "ws://127.0.0.1:8000/ws/chat")

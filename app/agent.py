@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 import anthropic
+import httpx2
 
 from . import config
 from .tenants import TenantConfig, get_or_default
@@ -25,7 +26,14 @@ _client: anthropic.Anthropic | None = None
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        # max_keepalive_connections=0: a pooled/reused connection reliably hangs on
+        # the 2nd+ request in this deployment (Windows host + asyncio event loop
+        # running alongside a blocking call) even though a fresh connection always
+        # succeeds — force a new connection per call rather than reusing one.
+        _client = anthropic.Anthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            http_client=httpx2.Client(limits=httpx2.Limits(max_keepalive_connections=0)),
+        )
     return _client
 
 
@@ -113,6 +121,7 @@ HONESTY & SAFETY
 - Never invent facts, prices, or offers beyond the company facts provided. If unknown, say a colleague will confirm.
 - Never pressure anyone. If not interested, thank them and end quickly.
 - If what you heard is garbled, unclear, or doesn't form a sensible sentence (likely a transcription error, not a real reply), don't guess its meaning or treat it as goodbye — just ask the caller to repeat themselves. Never set end_call=true for this reason alone.
+- Speech recognition mangles names and numbers even when the surrounding sentence sounds perfectly sensible, so a name you heard once is not yet a fact. Repeat any name, phone number, or other exact detail back to the caller and get their confirmation before you record it in lead_update or use it to address them. Never greet or thank a caller by an unconfirmed name.
 
 CALL FLOW
 1. Greet, state your name and company.

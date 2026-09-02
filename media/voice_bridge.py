@@ -23,6 +23,7 @@ import asyncio
 import audioop
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -33,16 +34,23 @@ log = logging.getLogger(__name__)
 
 TELEPHONY_SAMPLE_RATE = 8000  # Asterisk's format_wav requires an exact match to the endpoint's ulaw/alaw rate
 
+# Import app.config FIRST: it calls load_dotenv() at module scope, and the
+# os.getenv() lookups below must see .env or they silently fall back to the
+# stock model no matter what .env says.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from app import config as _app_config  # noqa: E402
+
+SERVER_WS = _app_config.AGENT_WS_URL
+
 # Fine-tuned on OpenSLR 54 Nepali speech (154hrs) — far more accurate than base
-# "small" on Nepali (WER 69.7% vs 125.2% in benchmarking). Falls back to the
-# stock model where the fine-tune isn't deployed (e.g. local dev machines).
-_NEPALI_FT_MODEL = "/home/mansa/whisper-small-nepali-ct2"
-WHISPER_MODEL_NAME = _NEPALI_FT_MODEL if Path(_NEPALI_FT_MODEL).exists() else "small"
+# "small" on Nepali (WER 26.69% vs stock small, which drops most utterances
+# entirely). Falls back to the stock model where the fine-tune isn't deployed.
+_NEPALI_FT_MODEL = os.getenv("WHISPER_MODEL_PATH", "/home/mansa/whisper-small-nepali-ct2")
+WHISPER_MODEL_NAME = _NEPALI_FT_MODEL if Path(_NEPALI_FT_MODEL).exists() else os.getenv("WHISPER_MODEL", "small")
 _VOICES_DIR = Path(__file__).parent / "voices"
 PIPER_VOICE_EN = str(_VOICES_DIR / "en_US-amy-medium.onnx")
 PIPER_VOICE_NE = str(_VOICES_DIR / "ne_NP-google-medium.onnx")
 PIPER_VOICE = PIPER_VOICE_EN  # default/back-compat for callers that don't pick a voice
-SERVER_WS = "ws://127.0.0.1:8000/ws/chat"
 
 
 def voice_for_text(text: str) -> str:
@@ -97,17 +105,37 @@ def _looks_like_hallucination(text: str) -> bool:
     return most_repeated / len(words) > 0.4
 
 
+_voices: dict[str, object] = {}
+
+
+def _get_voice(model_path: str):
+    """Load a Piper voice once and keep it. Loading is the expensive part —
+    the .onnx files here are 63-77MB, and re-reading one per utterance cost
+    ~5s of the turn budget when synthesis was a subprocess call."""
+    voice = _voices.get(model_path)
+    if voice is None:
+        from piper import PiperVoice
+        voice = PiperVoice.load(model_path)
+        _voices[model_path] = voice
+    return voice
+
+
 def synthesize(text: str, out_wav: str, voice: str = PIPER_VOICE) -> str:
     """Text → WAV file via Piper, resampled to 8kHz. Returns out_wav path."""
-    # Resolve piper next to the running interpreter — a bare "piper" relies on
-    # PATH, which process managers like pm2 don't populate with the venv's bin/.
-    piper_bin = str(Path(sys.executable).parent / "piper")
-    subprocess.run(
-        [piper_bin, "--model", voice, "--output_file", out_wav],
-        input=text.encode("utf-8"),
-        check=True,
-        capture_output=True,
-    )
+    try:
+        with wave.open(out_wav, "wb") as w:
+            _get_voice(voice).synthesize_wav(text, w)
+    except Exception:
+        # Fall back to the CLI so a piper-python API change can't take voice
+        # output down — slower, but a degraded reply beats silence on a call.
+        log.exception("in-process synthesis failed for %r, using piper CLI", voice)
+        piper_bin = str(Path(sys.executable).parent / "piper")
+        subprocess.run(
+            [piper_bin, "--model", voice, "--output_file", out_wav],
+            input=text.encode("utf-8"),
+            check=True,
+            capture_output=True,
+        )
     _resample_to_telephony_rate(out_wav)
     return out_wav
 
@@ -132,6 +160,49 @@ def _resample_to_telephony_rate(wav_path: str) -> None:
 
 # --------------------------------------------------------------- mic mode
 
+# Mirrors the VAD tuning in asterisk_bridge.py so the mic path and the
+# telephony path end an utterance on the same rules.
+MIC_SAMPLE_RATE = 16000
+RMS_SPEECH_THRESHOLD = 500       # out of 32768 full-scale
+SILENCE_TIMEOUT_MS = 700         # quiet for this long ends the utterance
+MIN_UTTERANCE_MS = 300           # ignore blips shorter than this
+MAX_UTTERANCE_MS = 15_000        # safety valve against a stuck-open mic
+MIC_LANGUAGE = os.getenv("MIC_LANGUAGE", "ne")
+
+
+def _record_until_silence(sd):
+    """Capture one utterance, stopping when the speaker goes quiet.
+
+    The old fixed 5-second window made every turn wait out the full window
+    even after the caller had finished, and truncated anyone who ran long.
+    """
+    import numpy as np
+
+    block = int(MIC_SAMPLE_RATE * 0.03)  # 30ms blocks
+    silence_blocks = int(SILENCE_TIMEOUT_MS / 30)
+    min_blocks = int(MIN_UTTERANCE_MS / 30)
+    max_blocks = int(MAX_UTTERANCE_MS / 30)
+
+    frames, quiet_run, spoken = [], 0, 0
+    with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=1,
+                        dtype="int16", blocksize=block) as stream:
+        while len(frames) < max_blocks:
+            data, _overflowed = stream.read(block)
+            frames.append(data.copy())
+            rms = float(np.sqrt(np.mean(data.astype("float64") ** 2)))
+            if rms >= RMS_SPEECH_THRESHOLD:
+                spoken += 1
+                quiet_run = 0
+            elif spoken >= min_blocks:
+                # Only start counting silence once real speech has happened,
+                # so leading hesitation doesn't end the turn immediately.
+                quiet_run += 1
+                if quiet_run >= silence_blocks:
+                    break
+
+    return np.concatenate(frames) if frames else np.zeros((0, 1), dtype="int16")
+
+
 async def mic_session(tenant_id: str | None):
     """Talk to the agent with your mic — full voice loop for local testing."""
     import sounddevice as sd
@@ -139,19 +210,19 @@ async def mic_session(tenant_id: str | None):
     import websockets
 
     async with websockets.connect(SERVER_WS) as ws:
-        if tenant_id:
-            await ws.send(json.dumps({"tenant_id": tenant_id}))
+        # /ws/chat always waits for a first client message before replying
+        # (app/main.py ws_chat) — must send the handshake even with no tenant.
+        await ws.send(json.dumps({"tenant_id": tenant_id}))
         greeting = await ws.recv()
         print(f"AGENT: {greeting}")
         _speak_local(greeting)
 
         while True:
-            print("… speak now (5s) …")
-            audio = sd.rec(int(5 * 16000), samplerate=16000, channels=1)
-            sd.wait()
+            print("… speak now …")
+            audio = _record_until_silence(sd)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                sf.write(f.name, audio, 16000)
-                text = transcribe_wav(f.name)
+                sf.write(f.name, audio, MIC_SAMPLE_RATE)
+                text = transcribe_wav(f.name, language=MIC_LANGUAGE)
             if not text:
                 print("(heard nothing)")
                 continue
