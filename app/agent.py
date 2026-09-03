@@ -87,10 +87,6 @@ class CallSession:
     tenant: TenantConfig = field(default_factory=lambda: get_or_default(None))
     messages: list = field(default_factory=list)
     lead: Lead = field(default_factory=Lead)
-    # Exact details heard once but not yet confirmed by the caller. See
-    # CONFIRM_REQUIRED — these are held here instead of being written to lead.
-    pending: dict = field(default_factory=dict)
-    pending_note: str = ""      # steering text to prepend to the next caller turn
     ended: bool = False
     started_at: float = field(default_factory=lambda: __import__("time").time())
     usage_totals: dict = field(default_factory=lambda: {
@@ -127,12 +123,14 @@ HONESTY & SAFETY
 - If what you heard is garbled, unclear, or doesn't form a sensible sentence (likely a transcription error, not a real reply), don't guess its meaning or treat it as goodbye — just ask the caller to repeat themselves. Never set end_call=true for this reason alone.
 - Speech recognition mangles names and numbers even when the surrounding sentence sounds perfectly sensible, so a name you heard once is not yet a fact. Repeat any name, phone number, or other exact detail back to the caller and get their confirmation before you record it in lead_update or use it to address them. Never greet or thank a caller by an unconfirmed name.
 - The turn you first hear a name or number, your ENTIRE reply must be the read-back question and nothing else — do not thank them, do not use the name, do not move on to the next question. Say it back the way you heard it and ask if that is right ("तपाईंको नाम चन्दन, ठीक छ?" / "That's Chandan — did I get that right?"). Only after the caller confirms may you use it or ask anything else. If they correct you, read the new version back the same way.
+- NEVER speak a name or a digit the caller has not actually said. You may only read back what is present in their words. If you did not hear a number, you do not have one — ask for it; do not produce digits to confirm. Inventing a plausible-sounding number is worse than having none.
+- A caller cannot say ten digits and be transcribed correctly in one go. Take a phone number in short pieces: ask for the first five digits, read those back, then the last five. Confirm each piece before asking for the next. If a piece comes back garbled twice, say a colleague will confirm the number and move on rather than looping.
 
 CALL FLOW
 1. Greet, state your name and company.
 2. Understand the caller's need.
 3. Collect the qualification answers listed in the company block, naturally — not as an interrogation.
-4. If qualified: confirm their phone number, promise human follow-up, close politely.
+4. If qualified: make sure a phone number is on record, promise human follow-up, close politely. When the connect message gives you the caller's number, that number is already correct — do NOT ask them to recite it. At most confirm it is the right one to call back on, and only ask for digits if they want a different number.
 5. End with a courteous closing (e.g., "धन्यवाद, शुभ दिन!" / "Thank you, have a great day!").
 
 OUTPUT FORMAT — respond ONLY with a JSON object, no other text:
@@ -179,16 +177,42 @@ def respond(session: CallSession, user_text: str) -> str:
     return _turn(session, user_text=user_text)
 
 
+# Placeholders used where no real caller ID exists (browser tests, the CLI).
+_NO_CALLER_ID = {"unknown", "portal-test", "", None}
+
+
+def caller_id_number(session: CallSession) -> str | None:
+    """The caller's own number, when telephony gave us one.
+
+    This is the number we should keep, and it costs nothing to obtain. Asking a
+    caller to recite ten digits is the single hardest thing for Nepali speech
+    recognition — in testing the agent misheard them and, worse, once invented
+    digits outright. Caller ID sidesteps that entirely.
+    """
+    number = (session.caller_number or "").strip()
+    if number in _NO_CALLER_ID or not any(ch.isdigit() for ch in number):
+        return None
+    return number
+
+
+def _connect_message(session: CallSession) -> str:
+    number = caller_id_number(session)
+    if number:
+        # Put it on the lead immediately: if the call drops early we still have
+        # a way to ring them back.
+        session.lead.phone = number
+        return ("[SYSTEM: The call just connected. The caller is calling from "
+                f"{number} — this number is already recorded and correct, so do not "
+                "ask them to recite their number. Greet the caller.]")
+    return ("[SYSTEM: The call just connected. Caller ID is not available, so ask "
+            "for a phone number in short pieces if you need one. Greet the caller.]")
+
+
 def _turn(session: CallSession, user_text: str | None) -> str:
     if user_text is not None:
-        if session.pending_note:
-            user_text = f"{session.pending_note}\n{user_text}"
-            session.pending_note = ""
         session.messages.append({"role": "user", "content": user_text})
     elif not session.messages:
-        session.messages.append(
-            {"role": "user", "content": "[SYSTEM: The call just connected. Greet the caller.]"}
-        )
+        session.messages.append({"role": "user", "content": _connect_message(session)})
 
     response = _get_client().messages.create(
         model=config.CLAUDE_MODEL,
@@ -215,64 +239,20 @@ def _turn(session: CallSession, user_text: str | None) -> str:
     return say
 
 
-# Fields where a transcription error is silent and costly: the sentence around
-# them sounds perfectly sensible, so nothing flags the mistake. A name heard
-# once is a guess — Whisper turned "चन्दन" into "सन्धान" in testing, and the
-# agent then addressed the caller by it. These are held until the caller says
-# the value a second time; everything else commits on first hearing.
-CONFIRM_REQUIRED = {"name", "phone"}
-
-
-def _normalize(value) -> str:
-    """Loose comparison key — punctuation and case shouldn't block a match."""
-    return re.sub(r"[\s।.,!?'\"-]+", "", str(value)).casefold()
-
-
+# The agent reads a value back to the caller BEFORE it reports it in
+# lead_update — a real call showed the read-back happening a full turn before
+# the field appeared. So an emitted value has already been confirmed out loud,
+# and an extra "hear it twice" gate only withheld correct data and derailed the
+# conversation. The guard lives in the prompt rules instead.
 def _apply_lead_update(session: CallSession, lead_update: dict) -> None:
-    """Commit newly learned fields, holding unconfirmed exact details back.
-
-    A CONFIRM_REQUIRED value is committed only once the model reports the same
-    value on a later turn — by then the caller has had a turn to correct it.
-    A different value replaces the pending one rather than committing, which is
-    exactly what a correction looks like.
-    """
-    newly_pending = {}
+    """Commit newly learned lead fields."""
     for k, v in lead_update.items():
         if v in (None, ""):
             continue
-        if k in CONFIRM_REQUIRED:
-            committed = getattr(session.lead, k, None) or session.lead.extra.get(k)
-            if committed is not None and _normalize(committed) == _normalize(v):
-                continue    # already confirmed; models re-send known fields
-                            # every turn, and re-gating would loop the agent
-                            # back to "is your name X?" forever
-            previous = session.pending.get(k)
-            if previous is None or _normalize(previous) != _normalize(v):
-                session.pending[k] = v
-                newly_pending[k] = v
-                continue                    # heard once — not a fact yet
-            session.pending.pop(k, None)    # said twice — now it's confirmed
         if hasattr(session.lead, k) and k != "extra":
             setattr(session.lead, k, v)
         else:
             session.lead.extra[k] = v
-
-    # Never silently drop what we heard: keep unconfirmed values on the lead,
-    # clearly labelled, so a human can follow up rather than losing the detail.
-    if session.pending:
-        session.lead.extra["unconfirmed"] = dict(session.pending)
-    else:
-        session.lead.extra.pop("unconfirmed", None)
-
-    if newly_pending:
-        detail = ", ".join(f'{k}="{v}"' for k, v in newly_pending.items())
-        # Carried into the next turn rather than appended now: a standalone
-        # message here would put two user turns back to back.
-        session.pending_note = (
-            f"[SYSTEM: You recorded {detail}, but the caller has not confirmed it and "
-            f"speech recognition mistakes these constantly. Read it back and ask them "
-            f"to confirm before you use it. Do not address them by an unconfirmed name.]"
-        )
 
 
 def _parse_envelope(raw: str) -> tuple[str, dict, bool]:

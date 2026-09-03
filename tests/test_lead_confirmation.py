@@ -1,155 +1,113 @@
-"""The confirmation gate on exact details.
+"""How exact details (names, phone numbers) reach the lead.
 
-Regression cover for a real failure: Whisper heard "मेरो नाम चन्दन हो" as
-"सन्धान", the agent wrote it to the lead and addressed the caller by it. A
-value that arrives once is a guess; these tests pin the rule that it takes a
-second hearing to become a fact.
+History worth keeping: a "hear it twice before recording" gate lived here
+briefly. A real call showed the agent reads a value back to the caller a full
+turn BEFORE it reports it in lead_update — so by the time a field arrives it
+has already been confirmed out loud, and the extra gate only withheld correct
+data and pushed the agent into a confusing re-confirmation. The read-back is
+enforced in the prompt rules; these tests cover what the code still owes:
+committing what the model reports, and never making the caller recite a phone
+number we already have.
 """
 from app import agent
 
 
-def _session() -> agent.CallSession:
-    return agent.CallSession(call_id="test-call")
+def _session(caller_number="unknown") -> agent.CallSession:
+    return agent.CallSession(call_id="test-call", caller_number=caller_number)
 
 
-def test_a_name_heard_once_is_not_written_to_the_lead():
+# ------------------------------------------------------------- lead updates
+
+def test_reported_fields_are_committed():
+    s = _session()
+    agent._apply_lead_update(s, {"name": "चन्दन", "interest": "Aprilia SR"})
+    assert s.lead.name == "चन्दन"
+    assert s.lead.interest == "Aprilia SR"
+
+
+def test_a_confirmed_name_lands_on_the_first_report():
+    """The regression this file exists for: the agent confirmed the name with
+    the caller, then reported it, and the old gate still withheld it — so the
+    lead came back with no name at all."""
+    s = _session()
+    agent._apply_lead_update(s, {"name": "चन्दन गुप्ता"})
+    assert s.lead.name == "चन्दन गुप्ता"
+
+
+def test_a_later_correction_overwrites():
     s = _session()
     agent._apply_lead_update(s, {"name": "सन्धान"})
-    assert s.lead.name is None
-    assert s.pending["name"] == "सन्धान"
-
-
-def test_a_name_heard_twice_is_committed():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    assert s.lead.name == "चन्दन"
-    assert "name" not in s.pending
-
-
-def test_a_correction_replaces_the_pending_value_without_committing():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "सन्धान"})   # misheard
-    agent._apply_lead_update(s, {"name": "चन्दन"})    # caller corrects
-    assert s.lead.name is None, "a corrected name must still need confirming"
-    assert s.pending["name"] == "चन्दन"
-    agent._apply_lead_update(s, {"name": "चन्दन"})    # confirmed
-    assert s.lead.name == "चन्दन"
-
-
-def test_a_confirmed_name_is_not_re_gated_when_the_model_resends_it():
-    """Models restate known fields every turn. Re-gating a value that is
-    already committed sent the agent back to "is your name X?" on every
-    later turn, ignoring whatever the caller had just said."""
-    s = _session()
-    agent._apply_lead_update(s, {"name": "चन्दन"})
     agent._apply_lead_update(s, {"name": "चन्दन"})
     assert s.lead.name == "चन्दन"
 
-    s.pending_note = ""
-    agent._apply_lead_update(s, {"name": "चन्दन", "interest": "Grazia"})
-    assert s.lead.name == "चन्दन"
-    assert not s.pending, "a confirmed value must not go back into the gate"
-    assert s.pending_note == "", "and must not re-trigger a read-back"
-    assert s.lead.interest == "Grazia", "the new information must still land"
 
-
-def test_a_confirmed_name_can_still_be_corrected_later():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    # Caller says "actually it's Chandani" — a genuinely different value must
-    # re-enter the gate rather than overwrite silently.
-    agent._apply_lead_update(s, {"name": "चन्दनी"})
-    assert s.lead.name == "चन्दन", "the confirmed value stands until reconfirmed"
-    assert s.pending["name"] == "चन्दनी"
-    agent._apply_lead_update(s, {"name": "चन्दनी"})
-    assert s.lead.name == "चन्दनी"
-
-
-def test_confirmation_ignores_punctuation_and_case():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    agent._apply_lead_update(s, {"name": "चन्दन।"})
-    assert s.lead.name == "चन्दन।"
-
-    s2 = _session()
-    agent._apply_lead_update(s2, {"name": "Chandan"})
-    agent._apply_lead_update(s2, {"name": "chandan"})
-    assert s2.lead.name == "chandan"
-
-
-def test_phone_numbers_are_gated_too():
-    s = _session()
-    agent._apply_lead_update(s, {"phone": "9808027608"})
-    assert s.lead.phone is None
-    agent._apply_lead_update(s, {"phone": "9808027608"})
-    assert s.lead.phone == "9808027608"
-
-
-def test_ordinary_fields_still_commit_immediately():
-    s = _session()
-    agent._apply_lead_update(s, {"interest": "scooter", "budget": "60000"})
-    assert s.lead.interest == "scooter"
-    assert s.lead.budget == "60000"
-    assert not s.pending
-
-
-def test_tenant_custom_fields_commit_immediately():
+def test_tenant_custom_fields_go_to_extra():
     s = _session()
     agent._apply_lead_update(s, {"preferred_colour": "red"})
     assert s.lead.extra["preferred_colour"] == "red"
 
 
-def test_unconfirmed_values_are_kept_on_the_lead_not_dropped():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "सन्धान"})
-    # The detail still reaches a human, clearly marked as unverified.
-    assert s.lead.to_dict()["unconfirmed"] == {"name": "सन्धान"}
-
-
-def test_the_unconfirmed_marker_clears_once_confirmed():
-    s = _session()
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    agent._apply_lead_update(s, {"name": "चन्दन"})
-    assert "unconfirmed" not in s.lead.to_dict()
-
-
 def test_empty_values_are_ignored():
     s = _session()
+    s.lead.name = "चन्दन"
     agent._apply_lead_update(s, {"name": "", "interest": None})
-    assert not s.pending
-    assert s.lead.name is None
+    assert s.lead.name == "चन्दन"
     assert s.lead.interest is None
 
 
-def test_a_first_hearing_queues_a_read_back_instruction():
+def test_extra_is_never_overwritten_wholesale():
     s = _session()
-    agent._apply_lead_update(s, {"name": "सन्धान"})
-    assert "सन्धान" in s.pending_note
-    assert "confirm" in s.pending_note.lower()
+    agent._apply_lead_update(s, {"extra": "nonsense"})
+    assert isinstance(s.lead.extra, dict)
 
 
-def test_the_instruction_rides_on_the_next_caller_turn_not_its_own_message():
-    """Two user messages back to back would be a malformed conversation."""
+# --------------------------------------------------------------- caller ID
+
+def test_caller_id_is_used_when_telephony_provides_one():
+    s = _session("+9779808027608")
+    assert agent.caller_id_number(s) == "+9779808027608"
+
+
+def test_placeholders_are_not_treated_as_caller_ids():
+    for placeholder in ("unknown", "portal-test", "", "   "):
+        assert agent.caller_id_number(_session(placeholder)) is None
+
+
+def test_a_number_from_caller_id_is_recorded_without_asking():
+    s = _session("+9779808027608")
+    msg = agent._connect_message(s)
+    # On the lead straight away: if the call drops we can still ring back.
+    assert s.lead.phone == "+9779808027608"
+    assert "+9779808027608" in msg
+    assert "do not" in msg.lower() and "recite" in msg.lower()
+
+
+def test_without_caller_id_the_agent_is_told_to_ask_in_pieces():
     s = _session()
-    s.messages.append({"role": "user", "content": "hello"})
-    s.messages.append({"role": "assistant", "content": "hi"})
-    agent._apply_lead_update(s, {"name": "सन्धान"})
-    assert s.messages[-1]["role"] == "assistant", "no message appended yet"
-
-    # Simulate the next turn's message assembly.
-    note, text = s.pending_note, "हो, चन्दन हो"
-    assert note
-    combined = f"{note}\n{text}"
-    s.messages.append({"role": "user", "content": combined})
-    s.pending_note = ""
-    roles = [m["role"] for m in s.messages]
-    assert all(a != b for a, b in zip(roles, roles[1:])), "roles must alternate"
-    assert text in s.messages[-1]["content"]
+    msg = agent._connect_message(s)
+    assert s.lead.phone is None
+    assert "short pieces" in msg
 
 
-def test_no_instruction_is_queued_for_ordinary_fields():
-    s = _session()
-    agent._apply_lead_update(s, {"interest": "scooter"})
-    assert s.pending_note == ""
+def test_the_connect_message_still_asks_for_a_greeting():
+    for number in ("+9779808027608", "unknown"):
+        assert "Greet the caller" in agent._connect_message(_session(number))
+
+
+# ------------------------------------------------------------- prompt rules
+
+def test_platform_rules_forbid_inventing_digits():
+    """The agent once read back a phone number the caller never said."""
+    rules = agent.PLATFORM_RULES
+    assert "NEVER speak a name or a digit the caller has not actually said" in rules
+    assert "Inventing a plausible-sounding number is worse than having none" in rules
+
+
+def test_platform_rules_split_long_numbers():
+    assert "cannot say ten digits" in agent.PLATFORM_RULES
+
+
+def test_platform_rules_still_require_a_read_back():
+    rules = agent.PLATFORM_RULES
+    assert "ENTIRE reply must be the read-back question" in rules
+    assert "Never greet or thank a caller by an unconfirmed name" in rules

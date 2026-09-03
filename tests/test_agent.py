@@ -71,8 +71,9 @@ def test_turn_merges_known_and_extra_lead_fields():
     assert session.lead.extra["custom_field"] == "vip"
 
 
-def test_turn_holds_an_unconfirmed_name_back_from_the_lead():
-    """Names are gated by CONFIRM_REQUIRED — see tests/test_lead_confirmation.py."""
+def test_turn_records_a_name_the_agent_reports():
+    """The agent confirms a name with the caller before reporting it, so a
+    reported name is committed — see tests/test_lead_confirmation.py."""
     cfg = tenants.TenantConfig(tenant_id="t1", company_name="Acme")
     session = agent.CallSession(call_id="c1", tenant=cfg)
     envelope = {"say": "got it", "lead_update": {"name": "Sita"}, "end_call": False}
@@ -80,8 +81,7 @@ def test_turn_holds_an_unconfirmed_name_back_from_the_lead():
         get_client.return_value.messages.create.return_value = _fake_response(envelope)
         agent.respond(session, "hello")
 
-    assert session.lead.name is None
-    assert session.pending["name"] == "Sita"
+    assert session.lead.name == "Sita"
 
 
 def test_turn_sets_ended_flag():

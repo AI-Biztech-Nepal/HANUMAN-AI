@@ -169,3 +169,33 @@ def test_transcribe_cleans_up_its_temp_file(monkeypatch):
     assert seen["language"] == "ne"
     assert seen["path"].endswith(".webm")
     assert not os.path.exists(seen["path"]), "temp audio must not be left on disk"
+
+
+# ------------------------------------------------------- end-of-call summary
+
+def test_call_summary_reads_cost_as_a_property_not_a_method():
+    """cost_usd is a @property and duration_sec is a method. Calling the
+    property crashed the disconnect handler and lost a whole test call."""
+    from app.main import _call_summary
+    from app import agent
+
+    s = agent.CallSession(call_id="c1")
+    s.messages = [{"role": "user", "content": "hi"},
+                  {"role": "assistant", "content": "hello"},
+                  {"role": "user", "content": "bye"},
+                  {"role": "assistant", "content": "goodbye"}]
+    s.usage_totals["input_tokens"] = 1000
+    s.usage_totals["output_tokens"] = 200
+
+    summary = _call_summary(s)
+    assert summary["turns"] == 2
+    assert isinstance(summary["cost_usd"], float)
+    assert summary["cost_usd"] > 0
+    assert isinstance(summary["duration_sec"], int)
+    assert summary["tokens"]["input_tokens"] == 1000
+
+
+def test_log_call_summary_does_not_raise():
+    from app.main import _log_call_summary
+    from app import agent
+    _log_call_summary(agent.CallSession(call_id="c2"))

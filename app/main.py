@@ -42,6 +42,13 @@ from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResp
 from . import agent, auth, dnc, storage, tenants, usage, voice, config
 
 log = logging.getLogger("hanuman")
+# uvicorn configures only its own loggers, so ours emitted nothing — the
+# per-call cost line was silently dropped. Attach a handler if the root has
+# none, and make sure INFO from this logger actually gets through.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log.setLevel(logging.INFO)
 
 app = FastAPI(title="hanuman.ai — AI Call Platform")
 
@@ -591,6 +598,8 @@ async def portal_voice_call(ws: WebSocket):
         tenant=cfg,
     )
 
+    saved = False
+
     async def say(text: str) -> None:
         await ws.send_json({"type": "say", "text": text})
         try:
@@ -619,10 +628,35 @@ async def portal_voice_call(ws: WebSocket):
             await ws.send_json({"type": "heard", "text": heard})
             await say(await asyncio.to_thread(agent.respond, session_obj, heard))
         storage.save_session(session_obj)
-        await ws.send_json({"type": "ended"})
+        saved = True
+        _log_call_summary(session_obj)
+        await ws.send_json({"type": "ended", **_call_summary(session_obj)})
         await ws.close()
     except WebSocketDisconnect:
-        pass
+        # Hanging up is the normal way a call ends — matching ws_chat, the
+        # lead and transcript must survive it, not just a tidy goodbye.
+        if not saved:
+            storage.save_session(session_obj)
+        _log_call_summary(session_obj)
+
+
+def _call_summary(session) -> dict:
+    """Per-call cost and length. Portal test calls are excluded from billing,
+    so this is the only place their cost is visible — and cost per call is a
+    gate on every roadmap phase."""
+    turns = sum(1 for m in session.messages if m["role"] == "assistant")
+    return {
+        "duration_sec": session.duration_sec(),
+        "turns": turns,
+        "cost_usd": round(session.cost_usd, 6),   # a property, not a method
+        "tokens": dict(session.usage_totals),
+    }
+
+
+def _log_call_summary(session) -> None:
+    s = _call_summary(session)
+    log.info("voice call %s: %d turns, %ds, $%.5f  tokens=%s",
+             session.call_id, s["turns"], s["duration_sec"], s["cost_usd"], s["tokens"])
 
 
 @app.get("/portal")

@@ -606,7 +606,12 @@ function onVoiceMessage(ev) {
     if (m.empty) { micState('listening', "Didn't catch that — go ahead."); listen(); }
     else addMsg(m.text, 'user');
   }
-  else if (m.type === 'ended') { micState('', 'Call ended.'); stopVoice(); }
+  else if (m.type === 'ended') {
+    const mins = Math.floor((m.duration_sec||0)/60), secs = (m.duration_sec||0)%60;
+    addMsg(`Call ended — ${mins}m ${secs}s, ${m.turns||0} replies, `
+         + `$${(m.cost_usd||0).toFixed(5)} of Claude usage`, 'agent');
+    micState('', 'Call ended.'); stopVoice();
+  }
   else if (m.type === 'error') { addMsg('[' + m.detail + ']', 'agent'); micState('', m.detail); }
 }
 
