@@ -35,3 +35,12 @@ ASTERISK_SOUNDS_DIR = os.getenv("ASTERISK_SOUNDS_DIR", "/var/lib/asterisk/sounds
 # Where the agent core's /ws/chat lives, from the bridge's perspective — override
 # when the bridge runs on a different host/VM than uvicorn (e.g. WSL vs. Windows).
 AGENT_WS_URL = os.getenv("AGENT_WS_URL", "ws://127.0.0.1:8000/ws/chat")
+
+# Outbound email (app/notify.py). Optional: with no SMTP_HOST the portal logs
+# reset and invite links instead of mailing them.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
+SMTP_STARTTLS = os.getenv("SMTP_STARTTLS", "true").lower() not in ("0", "false", "no")

@@ -54,10 +54,12 @@ def test_create_user_returns_a_one_time_invite_link():
     assert "/portal?invite=" in invite_url
 
 
-def test_there_is_no_public_signup_endpoint():
+def test_public_signup_still_requires_a_company_name():
+    """Signup is open now (see tests/test_signup_reset.py), but it creates a
+    company as well as a login — it cannot make a stray user with no tenant."""
     c = _client()
     assert c.post("/auth/signup", json={"email": "x@y.com",
-                                        "password": PASSWORD}).status_code == 404
+                                        "password": PASSWORD}).status_code == 400
 
 
 # ------------------------------------------------------------- invite → login

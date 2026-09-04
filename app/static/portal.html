@@ -107,6 +107,8 @@
   #loginStatus.err, #inviteStatus.err { color:var(--danger); }
   #loginStatus.ok, #inviteStatus.ok { color:var(--ok); }
   .login-hint { font-size:12.5px; color:var(--muted); text-align:center; margin-top:14px; line-height:1.5; }
+  .login-hint a { color:var(--accent); text-decoration:none; font-weight:500; }
+  .login-hint a:hover { text-decoration:underline; }
 
   /* ---------- voice call ---------- */
   .head-btns { display:flex; gap:7px; flex-shrink:0; }
@@ -240,7 +242,55 @@
            onkeydown="if(event.key==='Enter')login()">
     <button id="loginBtn" onclick="login()">Sign in</button>
     <div id="loginStatus"></div>
-    <div class="login-hint">No account yet? Your hanuman.ai contact sends you an invite link.</div>
+    <div class="login-hint">
+      <a href="#" onclick="showPage('forgot');return false">Forgot your password?</a>
+    </div>
+    <div class="login-hint">
+      New here? <a href="#" onclick="showPage('signup');return false">Create your company account</a>
+    </div>
+  </div>
+</div>
+
+<!-- SIGN UP -->
+<div class="page" id="page-signup">
+  <div class="login-logo">📞</div>
+  <div class="login-title">Create your account</div>
+  <div class="login-sub">Set up your AI agent to answer your business calls and collect leads.</div>
+  <div class="card">
+    <label>Company name</label>
+    <input id="suCompany" placeholder="e.g. Hamro G&amp;G Automobiles"
+           onkeydown="if(event.key==='Enter')$('suEmail').focus()">
+    <label>Your email</label>
+    <input id="suEmail" type="email" placeholder="you@company.com.np" autocomplete="username"
+           autocapitalize="off" onkeydown="if(event.key==='Enter')$('suPassword').focus()">
+    <label>Password</label>
+    <input id="suPassword" type="password" placeholder="At least 8 characters"
+           autocomplete="new-password" onkeydown="if(event.key==='Enter')signup()">
+    <button id="suBtn" onclick="signup()">Create account</button>
+    <div id="suStatus"></div>
+    <div class="login-hint">
+      You'll be the owner and can invite your team afterwards.
+    </div>
+    <div class="login-hint">
+      Already have an account? <a href="#" onclick="showPage('login');return false">Sign in</a>
+    </div>
+  </div>
+</div>
+
+<!-- FORGOT PASSWORD -->
+<div class="page" id="page-forgot">
+  <div class="login-logo">📞</div>
+  <div class="login-title">Reset your password</div>
+  <div class="login-sub">We'll send a link to choose a new one.</div>
+  <div class="card">
+    <label>Your email</label>
+    <input id="fpEmail" type="email" placeholder="you@company.com.np" autocomplete="username"
+           autocapitalize="off" onkeydown="if(event.key==='Enter')forgotPassword()">
+    <button id="fpBtn" onclick="forgotPassword()">Send reset link</button>
+    <div id="fpStatus"></div>
+    <div class="login-hint">
+      <a href="#" onclick="showPage('login');return false">Back to sign in</a>
+    </div>
   </div>
 </div>
 
@@ -403,6 +453,67 @@ function go(page) {
   if (page==='leads') loadLeads();
   if (page==='team') loadTeam();
   if (page==='test' && !ws && !vws) startChat();
+}
+
+// Swap between the signed-out screens (login / signup / forgot). These sit
+// outside go(), which is for the signed-in tabs and touches the nav bar.
+function showPage(name) {
+  $('nav').style.display='none';
+  $('topbar').style.display='none';
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  $('page-'+name).classList.add('active');
+  const focus = {login:'loginEmail', signup:'suCompany', forgot:'fpEmail'}[name];
+  if (focus) $(focus).focus();
+}
+
+async function signup() {
+  const company_name = $('suCompany').value.trim();
+  const email = $('suEmail').value.trim();
+  const password = $('suPassword').value;
+  const st = $('suStatus'); st.className=''; st.textContent='';
+  if (!company_name || !email || !password) {
+    st.className='err'; st.textContent='Fill in all three fields.'; return;
+  }
+  if (password.length < 8) {
+    st.className='err'; st.textContent='Use at least 8 characters.'; return;
+  }
+  const btn = $('suBtn'); btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    const r = await fetch('/auth/signup', {
+      method:'POST', headers: hdrs(), credentials:'same-origin',
+      body: JSON.stringify({ company_name, email, password }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    $('suPassword').value = '';
+    enter(await api('/portal/me'));
+  } catch(e) {
+    st.className='err'; st.textContent = e.message || 'Could not create the account.';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create account';
+  }
+}
+
+async function forgotPassword() {
+  const email = $('fpEmail').value.trim();
+  const st = $('fpStatus'); st.className=''; st.textContent='';
+  if (!email) { st.className='err'; st.textContent='Enter your email.'; return; }
+  const btn = $('fpBtn'); btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const r = await fetch('/auth/forgot', {
+      method:'POST', headers: hdrs(), credentials:'same-origin',
+      body: JSON.stringify({ email }),
+    });
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(j.detail || 'Could not send the link.');
+    // Deliberately the same message whether or not the address has an
+    // account — the server does not say, and neither should the page.
+    st.className='ok';
+    st.textContent = j.detail || 'If that email has an account, a reset link is on its way.';
+  } catch(e) {
+    st.className='err'; st.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Send reset link';
+  }
 }
 
 async function login() {

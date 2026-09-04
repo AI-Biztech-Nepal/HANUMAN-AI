@@ -47,7 +47,13 @@ test gets a fresh DB via the `tmp_db` fixture in `tests/conftest.py`.
 - Portal auth has two doors, both tenant-scoped: a session cookie (people, via
   email + password) and `X-Tenant-Key` (machines/integrations). New portal
   routes must accept both — take `session` and `x_tenant_key`, call
-  `_require_tenant`. There is no public signup; operators invite users.
+  `_require_capability(...)` (or `_require_tenant` where no role gates it).
+- Portal users have roles: owner > manager > staff, with the capability table
+  in `auth.PERMISSIONS`. A signed-in person is limited by their role; the
+  tenant API key is the company's integration credential and is not.
+- Signup is public (`POST /auth/signup` creates a company plus its owner) and
+  operators can still invite users directly. Password reset is self-service via
+  `POST /auth/forgot`; with no SMTP configured the link is logged, not mailed.
 - Metering (`usage.record_call`) must never raise into call handling.
 - Agent speech style: short sentences, one question per turn, no markdown — it's spoken.
 - Platform-level agent rules that must never be removed: admits it's an AI when asked;

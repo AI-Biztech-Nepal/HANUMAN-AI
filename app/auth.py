@@ -354,6 +354,19 @@ def accept_invite(token: str, password: str) -> User:
     return user
 
 
+def start_password_reset(email: str) -> tuple[User, str] | None:
+    """Begin a self-service reset. Returns (user, token) or None.
+
+    None covers every "no" — unknown address, suspended account, an invite
+    never accepted — because the caller must answer identically either way.
+    Telling a stranger which addresses have accounts is the whole attack.
+    """
+    user = get_user_by_email(email or "")
+    if user is None or user.status != "active":
+        return None
+    return user, reissue_invite(user.user_id)
+
+
 def reissue_invite(user_id: str) -> str:
     """Issue a fresh invite (lost link, or a password reset by the operator).
     Any previous invite for the user stops working."""
@@ -390,6 +403,22 @@ def _record_failure(email: str) -> None:
 
 def _clear_failures(email: str) -> None:
     _failed.pop(_throttle_key(email), None)
+
+
+# Generic rate limit for endpoints anyone can reach without signing in first
+# (signup, password reset). In-memory, like the login throttle above, which is
+# correct for the single-process pilot.
+_rate: dict[str, list[float]] = {}
+
+
+def check_rate(key: str, limit: int, window_seconds: int, what: str = "requests") -> None:
+    now = time.time()
+    hits = [t for t in _rate.get(key, []) if now - t < window_seconds]
+    if len(hits) >= limit:
+        _rate[key] = hits
+        raise AuthError(f"too many {what} — try again later")
+    hits.append(now)
+    _rate[key] = hits
 
 
 # ------------------------------------------------------------------- sessions

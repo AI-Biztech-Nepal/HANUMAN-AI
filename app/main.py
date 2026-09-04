@@ -35,11 +35,11 @@ import uuid
 from pathlib import Path
 
 from fastapi import (
-    Cookie, FastAPI, Form, Header, HTTPException, WebSocket, WebSocketDisconnect,
+    Cookie, FastAPI, Form, Header, HTTPException, Request, WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 
-from . import agent, auth, dnc, storage, tenants, usage, voice, config
+from . import agent, auth, dnc, notify, storage, tenants, usage, voice, config
 
 log = logging.getLogger("hanuman")
 # uvicorn configures only its own loggers, so ours emitted nothing — the
@@ -377,6 +377,69 @@ async def auth_me(session: str | None = Cookie(default=None, alias=SESSION_COOKI
     return {"user": user.to_dict(),
             "company_name": cfg.company_name if cfg else "",
             "can": {cap: user.can(cap) for cap in auth.PERMISSIONS}}
+
+
+@app.post("/auth/signup")
+async def auth_signup(body: dict, request: Request):
+    """Create a company and its first owner, then sign them straight in.
+
+    Self-serve onboarding (roadmap Phase 3). An operator-created tenant and a
+    self-created one are the same shape, so nothing downstream has to care
+    which door a company came through.
+    """
+    ip = request.client.host if request.client else "unknown"
+    try:
+        auth.check_rate(f"signup:{ip}", limit=5, window_seconds=3600, what="signups")
+        company_name = (body.get("company_name") or "").strip()
+        if not company_name:
+            raise auth.AuthError("your company name is required")
+        email = auth.normalize_email(body.get("email", ""))
+        auth.validate_password(body.get("password", ""))
+        if auth.get_user_by_email(email) is not None:
+            raise auth.AuthError("that email already has an account — sign in instead")
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    cfg = tenants.create(company_name=company_name)
+    try:
+        _user, invite_token = auth.create_user(cfg.tenant_id, email, role=auth.ROLE_OWNER)
+        user = auth.accept_invite(invite_token, body["password"])
+        user, session_token = auth.login(email, body["password"])
+    except auth.AuthError as exc:
+        # Never strand a company with no way in: undo the tenant we just made.
+        tenants.delete(cfg.tenant_id)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    resp = JSONResponse({"user": user.to_dict(), "company_name": cfg.company_name})
+    _set_session_cookie(resp, session_token)
+    return resp
+
+
+@app.post("/auth/forgot")
+async def auth_forgot(body: dict, request: Request):
+    """Ask for a password-reset link.
+
+    Answers identically whether or not the address has an account — a
+    different response here would let anyone enumerate customers.
+    """
+    ip = request.client.host if request.client else "unknown"
+    try:
+        auth.check_rate(f"forgot:{ip}", limit=10, window_seconds=3600, what="reset requests")
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+
+    said = {"detail": "If that email has an account, a reset link is on its way."}
+    result = auth.start_password_reset(body.get("email", ""))
+    if result is None:
+        return said
+    user, token = result
+    base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
+    link = f"{base}/portal?invite={token}"
+    if not notify.send_password_reset(user.email, link):
+        # No mail transport configured yet (pilot). Log it so an operator can
+        # pass it on by hand; never return it, or anyone could reset anyone.
+        log.warning("password reset for %s (no mailer configured): %s", user.email, link)
+    return said
 
 
 @app.get("/auth/invite/{token}")
