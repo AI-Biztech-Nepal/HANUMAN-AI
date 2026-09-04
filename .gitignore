@@ -8,3 +8,6 @@ venv/
 .venv-wsl/
 # Piper voice models (~134MB) — download per README, don't version them
 media/voices/
+
+# Your recorded voice dataset — audio, and personal. Keep it local.
+voice_dataset/
