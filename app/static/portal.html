@@ -87,6 +87,14 @@
   }
   button.icon-btn:active { background:var(--border); color:var(--text); }
 
+  /* Team row controls sit inline beside each other, not stacked full-width. */
+  .team-actions { display:flex; flex-wrap:wrap; gap:7px; align-items:center; margin-top:9px; }
+  .team-actions select {
+    width:auto; padding:8px 30px 8px 11px; font-size:13px;
+    background-position:right 10px center;
+  }
+  #inviteLink { font-size:12.5px; margin-top:8px; }
+
   /* ---------- login ---------- */
   #page-login { padding-top:14vh; }
   .login-logo {
@@ -292,6 +300,36 @@
     <label>Send hot leads to this phone number (optional)</label>
     <input id="a_transfer_to" placeholder="+9779812345678">
     <button id="saveBtn" onclick="saveAgent()">Save changes</button>
+    <div id="agentReadOnly" class="card-sub" style="display:none;margin-top:10px">
+      You have view-only access to the agent. Ask an owner or manager to make changes.
+    </div>
+  </div>
+</div>
+
+<!-- TEAM -->
+<div class="page" id="page-team">
+  <div class="card" id="inviteCardTeam">
+    <div class="card-title">Invite a colleague</div>
+    <div class="card-sub">They'll get a link to choose their own password.</div>
+    <label>Work email</label>
+    <input id="t_email" type="email" placeholder="name@yourcompany.com.np">
+    <label>What they can do</label>
+    <select id="t_role">
+      <option value="staff">Staff — see and work leads</option>
+      <option value="manager">Manager — leads, usage, and the agent script</option>
+      <option value="owner">Owner — everything, including the team</option>
+    </select>
+    <button id="inviteBtn" onclick="inviteMember()">Send invite</button>
+    <div id="inviteResult" style="display:none;margin-top:12px">
+      <div class="card-sub">Share this link with them — it works once and expires in 7 days.</div>
+      <input id="inviteLink" readonly onclick="this.select()">
+      <button class="ghost" onclick="copyInvite()">Copy link</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Your team</div>
+    <div id="teamList"></div>
   </div>
 </div>
 
@@ -328,6 +366,7 @@
   <a href="#" data-page="leads" class="active" onclick="go('leads');return false"><span class="ic">📋</span>Leads</a>
   <a href="#" data-page="agent" onclick="go('agent');return false"><span class="ic">🤖</span>My Agent</a>
   <a href="#" data-page="test" onclick="go('test');return false"><span class="ic">💬</span>Test Call</a>
+  <a href="#" data-page="team" id="navTeam" style="display:none" onclick="go('team');return false"><span class="ic">👥</span>Team</a>
 </nav>
 
 <div id="toast"></div>
@@ -362,6 +401,7 @@ function go(page) {
   $('page-'+page).classList.add('active');
   document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active', a.dataset.page===page));
   if (page==='leads') loadLeads();
+  if (page==='team') loadTeam();
   if (page==='test' && !ws && !vws) startChat();
 }
 
@@ -428,7 +468,7 @@ async function logout() {
   showLogin();
 }
 
-function enter(me) {
+async function enter(me) {
   $('coName').textContent = me.company_name;
   $('a_agent_name').value = me.agent_name||'';
   $('a_language').value = me.language||'auto';
@@ -438,8 +478,136 @@ function enter(me) {
   $('a_transfer_to').value = me.transfer_to||'';
   $('nav').style.display='flex';
   $('topbar').style.display='flex';
+  await loadCaps();
   checkVoice();
   go('leads');
+}
+
+// What this signed-in person may do. The server is the authority — this only
+// decides what to show, so a hidden button is a courtesy, never the guard.
+let CAPS = {};
+let ME = null;
+
+async function loadCaps() {
+  try {
+    const info = await api('/auth/me');
+    CAPS = info.can || {};
+    ME = info.user || null;
+  } catch(e) {
+    // Signed in with a tenant key rather than as a person: no role limits.
+    CAPS = { 'leads:read':true, 'agent:read':true, 'agent:write':true,
+             'usage:read':true, 'team:read':true, 'team:write':true };
+    ME = null;
+  }
+  applyCaps();
+}
+
+function applyCaps() {
+  $('navTeam').style.display = CAPS['team:read'] ? '' : 'none';
+  const mayEdit = !!CAPS['agent:write'];
+  $('saveBtn').style.display = mayEdit ? '' : 'none';
+  $('agentReadOnly').style.display = mayEdit ? 'none' : '';
+  ['a_agent_name','a_language','a_greeting','a_facts','a_questions','a_transfer_to']
+    .forEach(id => { $(id).disabled = !mayEdit; });
+  $('inviteCardTeam').style.display = CAPS['team:write'] ? '' : 'none';
+}
+
+const ROLE_LABEL = {
+  owner: 'Owner', manager: 'Manager', staff: 'Staff',
+};
+
+async function loadTeam() {
+  try {
+    const members = await api('/portal/team');
+    const mayWrite = !!CAPS['team:write'];
+    $('teamList').innerHTML = members.map(m => {
+      const isMe = ME && m.user_id === ME.user_id;
+      const pending = m.status === 'invited';
+      const suspended = m.status === 'suspended';
+      return `<div class="lead">
+        <div class="top-row">
+          <span class="who">${esc(m.email)}${isMe?' <span class="meta">(you)</span>':''}</span>
+          <span class="meta">${ROLE_LABEL[m.role]||esc(m.role)}</span>
+        </div>
+        <div class="tags">
+          ${pending?'<span class="pill">✉ invite pending</span>':''}
+          ${suspended?'<span class="pill">⏸ suspended</span>':''}
+          ${m.last_login_at?`<span class="pill">last in ${m.last_login_at.slice(0,10)}</span>`:''}
+        </div>
+        ${mayWrite && !isMe ? `<div class="team-actions">
+          <select onchange="changeRole('${m.user_id}', this.value)">
+            ${['staff','manager','owner'].map(r =>
+              `<option value="${r}"${r===m.role?' selected':''}>${ROLE_LABEL[r]}</option>`
+            ).join('')}
+          </select>
+          <button class="ghost small" onclick="reinvite('${m.user_id}')">New invite link</button>
+          <button class="ghost small" onclick="setStatus('${m.user_id}','${suspended?'active':'suspended'}')">
+            ${suspended?'Restore':'Suspend'}</button>
+          <button class="ghost small" onclick="removeMember('${m.user_id}','${esc(m.email)}')">Remove</button>
+        </div>` : ''}
+      </div>`;
+    }).join('');
+  } catch(e) { /* 401/403 handled by api(); nothing useful to show otherwise */ }
+}
+
+async function inviteMember() {
+  const email = $('t_email').value.trim();
+  if (!email) { showToast('Enter their email first'); return; }
+  const btn = $('inviteBtn'); btn.disabled = true;
+  try {
+    const r = await api('/portal/team', { method:'POST', body: JSON.stringify({
+      email, role: $('t_role').value,
+    })});
+    $('inviteLink').value = r.invite_url;
+    $('inviteResult').style.display = '';
+    $('t_email').value = '';
+    showToast('Invite created ✓');
+    loadTeam();
+  } catch(e) {
+    showToast(e.message || 'Could not create the invite');
+  } finally { btn.disabled = false; }
+}
+
+function copyInvite() {
+  const el = $('inviteLink');
+  el.select();
+  navigator.clipboard?.writeText(el.value)
+    .then(()=>showToast('Link copied ✓'))
+    .catch(()=>showToast('Press Ctrl+C to copy'));
+}
+
+async function changeRole(userId, role) {
+  try {
+    await api('/portal/team/' + userId, { method:'PATCH', body: JSON.stringify({ role }) });
+    showToast('Role updated ✓');
+  } catch(e) { showToast(e.message || 'Could not change the role'); }
+  loadTeam();
+}
+
+async function setStatus(userId, status) {
+  try {
+    await api('/portal/team/' + userId, { method:'PATCH', body: JSON.stringify({ status }) });
+    showToast(status === 'suspended' ? 'Access suspended' : 'Access restored ✓');
+  } catch(e) { showToast(e.message || 'Could not update access'); }
+  loadTeam();
+}
+
+async function reinvite(userId) {
+  try {
+    const r = await api('/portal/team/' + userId + '/invite', { method:'POST' });
+    $('inviteLink').value = r.invite_url;
+    $('inviteResult').style.display = '';
+    showToast('New link ready — share it with them');
+  } catch(e) { showToast(e.message || 'Could not create a link'); }
+}
+
+async function removeMember(userId, email) {
+  if (!confirm(`Remove ${email}? They lose access immediately.`)) return;
+  try {
+    await api('/portal/team/' + userId, { method:'DELETE' });
+    showToast('Removed');
+  } catch(e) { showToast(e.message || 'Could not remove them'); }
+  loadTeam();
 }
 
 function currentMonth() {
@@ -449,14 +617,20 @@ function currentMonth() {
 
 async function loadLeads() {
   try {
-    const [ls, usage] = await Promise.all([ api('/portal/leads'), api('/portal/usage') ]);
+    // Staff can work leads but not see usage, so a 403 there must not take
+    // the whole page down with it — show the lead count on its own.
+    const [ls, usage] = await Promise.all([
+      api('/portal/leads'),
+      CAPS['usage:read'] ? api('/portal/usage').catch(()=>null) : Promise.resolve(null),
+    ]);
     const month = currentMonth();
     const leadsThisMonth = ls.filter(l => (l.created_at||'').slice(0,7) === month).length;
 
-    $('statsRow').innerHTML = `
-      <div class="stat"><div class="num">${usage.calls ?? 0}</div><div class="lbl">Calls</div></div>
-      <div class="stat"><div class="num">${leadsThisMonth}</div><div class="lbl">Leads</div></div>
-      <div class="stat"><div class="num">${usage.minutes ?? 0}</div><div class="lbl">Minutes</div></div>`;
+    $('statsRow').innerHTML = (usage ? `
+      <div class="stat"><div class="num">${usage.calls ?? 0}</div><div class="lbl">Calls</div></div>` : '') + `
+      <div class="stat"><div class="num">${leadsThisMonth}</div><div class="lbl">Leads</div></div>` +
+      (usage ? `
+      <div class="stat"><div class="num">${usage.minutes ?? 0}</div><div class="lbl">Minutes</div></div>` : '');
 
     if (!ls.length) {
       $('leadsList').innerHTML = `<div class="empty-state"><div class="ic">📭</div>

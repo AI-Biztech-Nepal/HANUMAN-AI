@@ -299,6 +299,37 @@ def _require_tenant(
     return cfg
 
 
+def _require_capability(
+    capability: str,
+    x_tenant_key: str | None,
+    session: str | None,
+) -> tuple[tenants.TenantConfig, auth.User | None]:
+    """Authorise one portal action for both doors.
+
+    A person signs in and carries a role. The tenant API key is the company's
+    own integration credential, not a person, so it is not role-limited —
+    narrowing it would break existing integrations silently.
+    """
+    cfg = _require_tenant(x_tenant_key, session)
+    user = auth.user_for_session(session or "") if session else None
+    if user is None:
+        return cfg, None          # authenticated by tenant key
+    if not user.can(capability):
+        raise HTTPException(
+            status_code=403,
+            detail=f"your role ({user.role}) cannot do this — ask an owner",
+        )
+    return cfg, user
+
+
+def _require_team_member(user_id: str, cfg: tenants.TenantConfig) -> auth.User:
+    """Load a teammate, refusing anyone outside the caller's own company."""
+    target = auth.get_user(user_id)
+    if target is None or target.tenant_id != cfg.tenant_id:
+        raise HTTPException(status_code=404, detail="no such team member")
+    return target
+
+
 def _set_session_cookie(response: Response, token: str) -> None:
     # secure=True only when we know we're behind HTTPS — otherwise the cookie
     # would be dropped on a plain-HTTP pilot box and nobody could sign in.
@@ -341,8 +372,11 @@ async def auth_me(session: str | None = Cookie(default=None, alias=SESSION_COOKI
     if user is None:
         raise HTTPException(status_code=401, detail="not signed in")
     cfg = tenants.get(user.tenant_id)
+    # Ship the resolved capabilities, not just the role name, so the portal
+    # shows and hides sections without re-implementing the permission table.
     return {"user": user.to_dict(),
-            "company_name": cfg.company_name if cfg else ""}
+            "company_name": cfg.company_name if cfg else "",
+            "can": {cap: user.can(cap) for cap in auth.PERMISSIONS}}
 
 
 @app.get("/auth/invite/{token}")
@@ -407,7 +441,12 @@ async def admin_create_user(
     if tenants.get(tenant_id) is None:
         raise HTTPException(404, "tenant not found")
     try:
-        user, token = auth.create_user(tenant_id, body.get("email", ""))
+        # A tenant's first login is its owner: they have nobody above them to
+        # grant permissions, so an operator-created account defaults to owner.
+        default_role = auth.ROLE_OWNER if not auth.list_users(tenant_id) else auth.ROLE_STAFF
+        user, token = auth.create_user(
+            tenant_id, body.get("email", ""), role=body.get("role", default_role)
+        )
     except auth.AuthError as exc:
         raise HTTPException(400, str(exc))
     base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
@@ -429,7 +468,9 @@ async def admin_reissue_invite(user_id: str, x_admin_key: str | None = Header(de
 @app.delete("/admin/users/{user_id}")
 async def admin_delete_user(user_id: str, x_admin_key: str | None = Header(default=None)):
     _require_admin(x_admin_key)
-    auth.delete_user(user_id)
+    # force: offboarding a company means removing its last owner, and the
+    # operator is who unsticks a company that has lost one.
+    auth.delete_user(user_id, force=True)
     return {"deleted": user_id}
 
 
@@ -450,7 +491,7 @@ async def portal_update(
     x_tenant_key: str | None = Header(default=None),
     session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    cfg = _require_tenant(x_tenant_key, session)
+    cfg, _user = _require_capability("agent:write", x_tenant_key, session)
     for k, v in body.items():
         if k in PORTAL_EDITABLE:
             setattr(cfg, k, v)
@@ -458,6 +499,96 @@ async def portal_update(
     d = cfg.to_dict()
     d.pop("api_key", None)
     return d
+
+
+# ------------------------------------------------------------- portal: team
+
+@app.get("/portal/team")
+async def portal_team(
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    """Everyone on this company's account."""
+    cfg, _user = _require_capability("team:read", x_tenant_key, session)
+    return JSONResponse(auth.list_users(cfg.tenant_id))
+
+
+@app.post("/portal/team")
+async def portal_team_invite(
+    body: dict,
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    """Invite a colleague. Returns the one-time link for the owner to pass on —
+    there is no mail sender in the pilot, so the link is shown in the portal."""
+    cfg, _user = _require_capability("team:write", x_tenant_key, session)
+    try:
+        user, token = auth.create_user(
+            cfg.tenant_id, body.get("email", ""),
+            role=body.get("role", auth.ROLE_STAFF),
+        )
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
+    return {"user": user.to_dict(), "invite_url": f"{base}/portal?invite={token}"}
+
+
+@app.patch("/portal/team/{user_id}")
+async def portal_team_update(
+    user_id: str,
+    body: dict,
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    """Change a teammate's role, or suspend and restore their access."""
+    cfg, actor = _require_capability("team:write", x_tenant_key, session)
+    target = _require_team_member(user_id, cfg)
+    if actor is not None and target.user_id == actor.user_id:
+        # Self-demotion is the other way to strand a company without an owner.
+        raise HTTPException(status_code=400, detail="you cannot change your own role")
+    try:
+        if "role" in body:
+            target = auth.set_role(user_id, body["role"])
+        if "status" in body:
+            if body["status"] not in ("active", "suspended"):
+                raise HTTPException(status_code=400, detail="status must be active or suspended")
+            auth.set_status(user_id, body["status"])
+            target.status = body["status"]
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return target.to_dict()
+
+
+@app.delete("/portal/team/{user_id}")
+async def portal_team_remove(
+    user_id: str,
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    cfg, actor = _require_capability("team:write", x_tenant_key, session)
+    target = _require_team_member(user_id, cfg)
+    if actor is not None and target.user_id == actor.user_id:
+        raise HTTPException(status_code=400, detail="you cannot remove yourself")
+    try:
+        auth.delete_user(user_id)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"removed": user_id}
+
+
+@app.post("/portal/team/{user_id}/invite")
+async def portal_team_reinvite(
+    user_id: str,
+    x_tenant_key: str | None = Header(default=None),
+    session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+):
+    """Fresh invite link — for a colleague who lost theirs or forgot their
+    password. Any earlier link for them stops working."""
+    cfg, _actor = _require_capability("team:write", x_tenant_key, session)
+    _require_team_member(user_id, cfg)
+    token = auth.reissue_invite(user_id)
+    base = config.PUBLIC_BASE_URL.rstrip("/") or "http://127.0.0.1:8000"
+    return {"invite_url": f"{base}/portal?invite={token}"}
 
 
 @app.get("/portal/leads")
@@ -474,7 +605,7 @@ async def portal_usage(
     x_tenant_key: str | None = Header(default=None),
     session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    cfg = _require_tenant(x_tenant_key, session)
+    cfg, _user = _require_capability("usage:read", x_tenant_key, session)
     s = usage.summary(cfg.tenant_id)
     s["included_minutes"] = cfg.included_minutes
     return s

@@ -28,6 +28,28 @@ SESSION_TTL_DAYS = 30          # portal is a mobile PWA; long sessions are expec
 INVITE_TTL_DAYS = 7
 MIN_PASSWORD_LENGTH = 8
 
+# Roles, widest first. A company runs its own team inside the portal: the owner
+# invites staff, and not everyone who answers leads should be able to rewrite
+# what the agent says on every call.
+ROLE_OWNER = "owner"       # everything, including the team and billing
+ROLE_MANAGER = "manager"   # agent script, leads, usage — but not the team
+ROLE_STAFF = "staff"       # leads only
+ROLES = (ROLE_OWNER, ROLE_MANAGER, ROLE_STAFF)
+
+# capability -> roles that hold it. Checked in main.py on every portal write.
+PERMISSIONS = {
+    "leads:read":   {ROLE_OWNER, ROLE_MANAGER, ROLE_STAFF},
+    "agent:read":   {ROLE_OWNER, ROLE_MANAGER, ROLE_STAFF},
+    "agent:write":  {ROLE_OWNER, ROLE_MANAGER},
+    "usage:read":   {ROLE_OWNER, ROLE_MANAGER},
+    "team:read":    {ROLE_OWNER, ROLE_MANAGER},
+    "team:write":   {ROLE_OWNER},
+}
+
+
+def can(role: str, capability: str) -> bool:
+    return role in PERMISSIONS.get(capability, set())
+
 # scrypt cost. n=2**14 keeps a login around ~50-100ms on a small VPS, which is
 # slow enough to matter to an attacker and fast enough not to block a call.
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
@@ -53,6 +75,7 @@ class User:
     status: str = "active"          # active | suspended | invited
     created_at: str = ""
     last_login_at: str = ""
+    role: str = ROLE_STAFF          # least privilege unless stated otherwise
 
     def to_dict(self) -> dict:
         return {
@@ -62,7 +85,11 @@ class User:
             "status": self.status,
             "created_at": self.created_at,
             "last_login_at": self.last_login_at,
+            "role": self.role,
         }
+
+    def can(self, capability: str) -> bool:
+        return can(self.role, capability)
 
 
 def _now() -> datetime:
@@ -83,9 +110,16 @@ def _conn():
             password_hash TEXT NOT NULL DEFAULT '',
             status        TEXT NOT NULL DEFAULT 'invited',
             created_at    TEXT NOT NULL,
-            last_login_at TEXT NOT NULL DEFAULT ''
+            last_login_at TEXT NOT NULL DEFAULT '',
+            role          TEXT NOT NULL DEFAULT 'staff'
         )"""
     )
+    # Migration for databases created before roles existed. Accounts that
+    # predate this were a tenant's only login and had unrestricted access, so
+    # they become owners — demoting them silently would lock people out.
+    if "role" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'staff'")
+        conn.execute("UPDATE users SET role = 'owner'")
     # Tokens are stored hashed: a dump of this table must not hand anyone a
     # live session or a usable invite.
     conn.execute(
@@ -152,33 +186,43 @@ def normalize_email(email: str) -> str:
 
 def _row_to_user(row) -> User:
     return User(user_id=row[0], tenant_id=row[1], email=row[2],
-                status=row[4], created_at=row[5], last_login_at=row[6])
+                status=row[4], created_at=row[5], last_login_at=row[6],
+                role=row[7] if len(row) > 7 else ROLE_STAFF)
 
 
-_USER_COLS = "user_id, tenant_id, email, password_hash, status, created_at, last_login_at"
+_USER_COLS = ("user_id, tenant_id, email, password_hash, status, "
+              "created_at, last_login_at, role")
 
 
-def create_user(tenant_id: str, email: str) -> tuple[User, str]:
+def validate_role(role: str) -> str:
+    if role not in ROLES:
+        raise AuthError(f"role must be one of: {', '.join(ROLES)}")
+    return role
+
+
+def create_user(tenant_id: str, email: str, role: str = ROLE_STAFF) -> tuple[User, str]:
     """Create an invited user. Returns (user, one-time invite token).
 
     The token is returned once and never recoverable — only its hash is
     stored, so a lost invite means issuing a new one.
     """
     email = normalize_email(email)
+    validate_role(role)
     user = User(
         user_id=secrets.token_hex(8),
         tenant_id=tenant_id,
         email=email,
         status="invited",
         created_at=_iso(_now()),
+        role=role,
     )
     invite_token = secrets.token_urlsafe(32)
     try:
         with _conn() as conn:
             conn.execute(
-                f"INSERT INTO users ({_USER_COLS}) VALUES (?,?,?,?,?,?,?)",
+                f"INSERT INTO users ({_USER_COLS}) VALUES (?,?,?,?,?,?,?,?)",
                 (user.user_id, user.tenant_id, user.email, "",
-                 user.status, user.created_at, ""),
+                 user.status, user.created_at, "", user.role),
             )
             conn.execute(
                 "INSERT INTO invites (token_hash, user_id, expires_at) VALUES (?,?,?)",
@@ -216,15 +260,58 @@ def list_users(tenant_id: str) -> list[dict]:
     return [_row_to_user(r).to_dict() for r in rows]
 
 
-def delete_user(user_id: str) -> None:
+def count_owners(tenant_id: str, excluding: str = "") -> int:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND role = ? "
+            "AND status != 'suspended' AND user_id != ?",
+            (tenant_id, ROLE_OWNER, excluding),
+        ).fetchone()[0]
+
+
+def _guard_last_owner(user: User, force: bool) -> None:
+    """A company that loses its last owner can no longer manage its own team
+    or billing, so the portal refuses the step that would strand it.
+
+    `force` is the platform operator's override: they are the party who
+    resolves a stranded company, and offboarding one means removing its last
+    login. Only admin endpoints pass it.
+    """
+    if force:
+        return
+    if user.role == ROLE_OWNER and count_owners(user.tenant_id, excluding=user.user_id) == 0:
+        raise AuthError("this is the only owner — promote someone else first")
+
+
+def set_role(user_id: str, role: str, force: bool = False) -> User:
+    validate_role(role)
+    user = get_user(user_id)
+    if user is None:
+        raise AuthError("no such user")
+    if user.role != role:
+        _guard_last_owner(user, force)
+    with _conn() as conn:
+        conn.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+    user.role = role
+    return user
+
+
+def delete_user(user_id: str, force: bool = False) -> None:
+    user = get_user(user_id)
+    if user is not None:
+        _guard_last_owner(user, force)
     with _conn() as conn:
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM invites WHERE user_id = ?", (user_id,))
 
 
-def set_status(user_id: str, status: str) -> None:
+def set_status(user_id: str, status: str, force: bool = False) -> None:
     """Suspend or reactivate. Suspending also kills every live session."""
+    if status != "active":
+        user = get_user(user_id)
+        if user is not None:
+            _guard_last_owner(user, force)
     with _conn() as conn:
         conn.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
         if status != "active":
