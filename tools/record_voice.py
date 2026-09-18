@@ -33,6 +33,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from tools import voices
+
 # Piper trains at 22.05kHz; recording at the training rate avoids a resample.
 SAMPLE_RATE = 22050
 SILENCE_HOLD_S = 0.9          # quiet for this long ends a take
@@ -40,17 +42,15 @@ RMS_SPEECH = 450              # out of 32768, matching the call pipeline's VAD
 MAX_TAKE_S = 20.0
 LEAD_IN_S = 0.25              # keep a little room before the first word
 
-DATASET = REPO / "voice_dataset"
-WAVS = DATASET / "wavs"
-METADATA = DATASET / "metadata.csv"
 DEFAULT_PROMPTS = REPO / "tools" / "prompts_ne.txt"
 
+# Set from --voice in main(); each agent records into its own dataset.
+DATASET = WAVS = METADATA = None
 
-def load_prompts(path: Path) -> list[str]:
-    if not path.exists():
-        sys.exit(f"no prompt file at {path}")
-    lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()]
-    return [ln for ln in lines if ln and not ln.startswith("#")]
+
+def use_voice(voice) -> None:
+    global DATASET, WAVS, METADATA
+    DATASET, WAVS, METADATA = voice.dataset, voice.wavs, voice.metadata
 
 
 def load_done() -> dict[str, str]:
@@ -141,11 +141,17 @@ def peak_dbfs(audio, np) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--voice", default=voices.DEFAULT_VOICE,
+                    help=f"which agent's voice ({', '.join(sorted(voices.VOICES))})")
     ap.add_argument("--prompts", type=Path, default=DEFAULT_PROMPTS)
     ap.add_argument("--status", action="store_true", help="show progress and exit")
     args = ap.parse_args()
 
-    prompts = load_prompts(args.prompts)
+    voice = voices.get(args.voice)
+    use_voice(voice)
+    prompts = voices.load_prompts(args.prompts, voice)
+    print(f"voice: {voice.name_en} ({voice.name_ne}, {voice.gender}) "
+          f"-> {voice.dataset.name}\n")
     if args.status:
         report(prompts)
         return 0

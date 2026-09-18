@@ -11,3 +11,11 @@ media/voices/
 
 # Your recorded voice dataset — audio, and personal. Keep it local.
 voice_dataset/
+voice_dataset_*/
+
+# Generated reading sheet for phone recording (rebuild from prompts_ne.txt)
+voice_prompts_batches.txt
+
+# Generated voice samples — rebuild with tools/nepali_voice.py
+samples*/
+samples_*.wav

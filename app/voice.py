@@ -112,8 +112,15 @@ def transcribe(audio: bytes, language: str | None = "ne", suffix: str = ".webm")
                 pass
 
 
-def speak(text: str, language: str | None = None) -> bytes:
-    """Text → WAV bytes at full quality (no telephony downsampling)."""
+def speak(text: str, language: str | None = None,
+          agent_voice: str | None = None) -> bytes:
+    """Text → WAV bytes at full quality (no telephony downsampling).
+
+    `agent_voice` is a voice key from tools/voices.py ("ashika", "sagar").
+    Given one, Piper's speech is re-timbred to that agent before it goes out;
+    the words and the Nepali pronunciation are Piper's either way. If tone
+    conversion is unavailable the caller still gets audio, in the base voice.
+    """
     vb = _get_bridge()
     if vb is None:
         raise RuntimeError(_load_error or "voice pipeline unavailable")
@@ -126,10 +133,14 @@ def speak(text: str, language: str | None = None) -> bytes:
             path = f.name
         vb.synthesize(text, path, voice=voice, telephony=False)
         with open(path, "rb") as f:
-            return f.read()
+            audio = f.read()
     finally:
         if path:
             try:
                 os.unlink(path)
             except OSError:
                 pass
+    if agent_voice:
+        from . import tone
+        audio = tone.convert(audio, agent_voice)
+    return audio

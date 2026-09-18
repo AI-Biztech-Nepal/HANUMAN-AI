@@ -39,7 +39,7 @@ from fastapi import (
 )
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 
-from . import agent, auth, dnc, notify, storage, tenants, usage, voice, config
+from . import agent, auth, dnc, notify, storage, tenants, tone, usage, voice, config
 
 log = logging.getLogger("hanuman")
 # uvicorn configures only its own loggers, so ours emitted nothing — the
@@ -786,6 +786,13 @@ async def portal_voice_call(ws: WebSocket):
         return
 
     lang = cfg.language if cfg.language in ("ne", "en") else None
+    # The tenant's agent_name picks the cloned voice, when one exists for it.
+    # Say which, and say when there is none: falling back to the base voice is
+    # silent by design, so without this line a misspelled agent_name looks
+    # exactly like a working call that happens to sound wrong.
+    agent_voice = tone.voice_key_for(cfg.agent_name)
+    log.info("voice call: tenant=%s agent=%r voice=%s lang=%s",
+             cfg.tenant_id, cfg.agent_name, agent_voice or "BASE (no match)", lang)
     session_obj = agent.CallSession(
         call_id="portal-voice-" + str(uuid.uuid4())[:8],
         caller_number="portal-test",     # keeps test calls out of billing
@@ -797,7 +804,8 @@ async def portal_voice_call(ws: WebSocket):
     async def say(text: str) -> None:
         await ws.send_json({"type": "say", "text": text})
         try:
-            await ws.send_bytes(await asyncio.to_thread(voice.speak, text, lang))
+            await ws.send_bytes(
+                await asyncio.to_thread(voice.speak, text, lang, agent_voice))
         except Exception:                             # noqa: BLE001
             # A failed synthesis must not end the call — the text is already
             # on screen, so the conversation can continue without audio.
