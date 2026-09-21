@@ -21,6 +21,17 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 TTS_VOICE = os.getenv("TTS_VOICE", "en_US-amy-medium")
 
+# Re-timbre Piper's speech to the agent's own voice (app/tone.py). On: the
+# agent must sound like its own person, not like whoever recorded the base
+# model. The conversion moves timbre but not rhythm, so it is a likeness
+# rather than the person, and it costs some high-frequency detail — the
+# closest we get until that voice has its own trained model, which needs no
+# conversion pass at all; see tools/train_voice.py.
+#
+# Set VOICE_TONE_CONVERSION=0 to fall back to the plain base voice.
+VOICE_TONE_CONVERSION = os.getenv("VOICE_TONE_CONVERSION", "1").lower() in (
+    "1", "true", "yes", "on")
+
 LEADS_DB_PATH = os.getenv("LEADS_DB_PATH", "./leads.db")
 
 # Asterisk ARI bridge (media/asterisk_bridge.py) — Phase 1, groundwork.

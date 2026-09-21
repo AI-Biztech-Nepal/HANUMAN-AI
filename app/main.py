@@ -754,8 +754,12 @@ async def portal_voice_status(
     state = await asyncio.to_thread(voice.status)
     if state.get("available"):
         # Load the models now, in the background, so the first spoken turn
-        # doesn't pay for it. Deliberately not awaited.
-        asyncio.create_task(asyncio.to_thread(voice.warmup))
+        # doesn't pay for it. Deliberately not awaited. Passing this tenant's
+        # voice warms the tone converter for the agent they will actually
+        # hear, rather than only the models shared by everyone.
+        cfg = _tenant_for_session(session) if session else None
+        agent_voice = tone.voice_key_for(cfg.agent_name) if cfg else ""
+        asyncio.create_task(asyncio.to_thread(voice.warmup, agent_voice or ""))
     return state
 
 
@@ -791,6 +795,11 @@ async def portal_voice_call(ws: WebSocket):
     # silent by design, so without this line a misspelled agent_name looks
     # exactly like a working call that happens to sound wrong.
     agent_voice = tone.voice_key_for(cfg.agent_name)
+    if agent_voice and not config.VOICE_TONE_CONVERSION:
+        # Tone conversion is off (see config). A trained voice still speaks as
+        # itself — speak() only converts when there is no model for the agent —
+        # so this switch silences the converter, not the voice.
+        agent_voice = agent_voice if tone.model_for(agent_voice) else ""
     log.info("voice call: tenant=%s agent=%r voice=%s lang=%s",
              cfg.tenant_id, cfg.agent_name, agent_voice or "BASE (no match)", lang)
     session_obj = agent.CallSession(

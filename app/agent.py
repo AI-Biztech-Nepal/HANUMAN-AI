@@ -146,7 +146,9 @@ def _tenant_block(t: TenantConfig) -> str:
         f"Lead fields you may set in lead_update: {', '.join(t.lead_fields)}",
     ]
     if t.greeting:
-        parts.append(f"Custom opening line (use it, adapted to caller's language): {t.greeting}")
+        parts.append(
+            "Opening line (ALREADY SPOKEN, word for word, as the first thing on "
+            f"this call — do not greet again or repeat it): {t.greeting}")
     if t.facts:
         parts.append(f"Company facts you may state:\n{t.facts}")
     if t.transfer_to:
@@ -168,8 +170,29 @@ def _system_blocks(t: TenantConfig) -> list[dict]:
 # ---------------------------------------------------------------- turns
 
 def greeting(session: CallSession) -> str:
-    """Opening line when the call connects."""
-    return _turn(session, user_text=None)
+    """Opening line when the call connects.
+
+    A tenant who typed an opening line gets that line, word for word. It used
+    to be passed to Claude as guidance to adapt, which paraphrased it fresh on
+    every call — so the company's own wording was never quite what callers
+    heard, and no two calls opened the same way.
+
+    Saying it verbatim also lets the agent open in its own recorded voice:
+    voice.speak plays a real recording when the words match one, and a line
+    rewritten each call can never match. And it skips an API round trip on the
+    one turn where nothing has been said yet for Claude to respond to.
+    """
+    line = (session.tenant.greeting or "").strip()
+    if not line:
+        return _turn(session, user_text=None)
+
+    # Keep the transcript honest: the model must see what the caller heard,
+    # or its next turn will answer a greeting that was never spoken.
+    if not session.messages:
+        session.messages.append({"role": "user", "content": _connect_message(session)})
+    session.messages.append(
+        {"role": "assistant", "content": json.dumps({"say": line}, ensure_ascii=False)})
+    return line
 
 
 def respond(session: CallSession, user_text: str) -> str:

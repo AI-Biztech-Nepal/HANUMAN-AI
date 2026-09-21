@@ -37,6 +37,22 @@ class Voice:
     def metadata(self) -> Path:
         return self.dataset / "metadata.csv"
 
+    @property
+    def model(self) -> Path:
+        """Where this voice's own fine-tuned Piper model lives, once trained.
+
+        Until it exists the agent speaks through a base Piper model with the
+        timbre converted by OpenVoice (see app/tone.py) — right words, roughly
+        the right voice, someone else's rhythm. A trained model here replaces
+        both halves: it says the words in this speaker's own voice and cadence,
+        and needs no conversion pass at all.
+        """
+        return REPO / "media" / "voices" / f"{self.key}.onnx"
+
+    @property
+    def trained(self) -> bool:
+        return self.model.exists()
+
 
 VOICES = {
     "sagar": Voice("sagar", "सागर", "Sagar", "male", ("saagar", "sagarji")),
