@@ -13,6 +13,10 @@ media/voices/
 voice_dataset/
 voice_dataset_*/
 
+# Exception, by explicit request: Sagar's finished dataset (342 clips, the
+# level/clipping problems found and fixed this session) is tracked.
+!voice_dataset_sagar/
+
 # Generated reading sheet for phone recording (rebuild from prompts_ne.txt)
 voice_prompts_batches.txt
 
