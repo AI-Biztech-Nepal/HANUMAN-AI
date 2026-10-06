@@ -895,4 +895,4 @@ async def manifest():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": config.CLAUDE_MODEL}
+    return {"status": "ok", "backend": config.LLM_BACKEND, "model": agent.active_model()}

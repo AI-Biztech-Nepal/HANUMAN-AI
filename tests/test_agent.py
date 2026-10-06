@@ -148,3 +148,106 @@ def test_tenant_block_includes_greeting_and_facts():
     assert "Welcome to Acme!" in block
     assert "We sell widgets." in block
     assert "Acme" in block
+
+
+# ---------------------------------------------------------------- envelope schema & backends
+
+def _objects(node):
+    """Every object-typed node in a JSON schema, however deeply nested."""
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            yield node
+        for v in node.values():
+            yield from _objects(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _objects(v)
+
+
+def test_envelope_schema_closes_every_object():
+    # Claude's structured outputs reject any object lacking
+    # additionalProperties: false — an open lead_update 400s the whole turn.
+    cfg = tenants.TenantConfig(tenant_id="t1", company_name="Acme")
+    for obj in _objects(agent._envelope_schema(cfg)):
+        assert obj.get("additionalProperties") is False
+
+
+def test_envelope_schema_lead_update_is_the_tenants_own_fields():
+    cfg = tenants.TenantConfig(tenant_id="t1", company_name="Acme",
+                               lead_fields=["name", "budget", "qualified", "car_model"])
+    lead = agent._envelope_schema(cfg)["properties"]["lead_update"]["properties"]
+    assert set(lead) == {"name", "budget", "qualified", "car_model"}
+    assert lead["qualified"] == {"type": "boolean"}
+    assert lead["car_model"] == {"type": "string"}     # tenant-custom field is allowed
+
+
+def test_local_backend_never_builds_a_claude_client(monkeypatch):
+    # The zero-key promise: with LLM_BACKEND=ollama a turn must not touch the
+    # Anthropic client, so a blank ANTHROPIC_API_KEY cannot matter.
+    monkeypatch.setattr(agent.config, "LLM_BACKEND", "ollama")
+    monkeypatch.setattr(agent.config, "ANTHROPIC_API_KEY", "")
+    cfg = tenants.TenantConfig(tenant_id="t1", company_name="Acme")
+    envelope = {"say": "नमस्ते", "lead_update": {}, "end_call": False}
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"message": {"content": json.dumps(envelope)},
+                               "prompt_eval_count": 7, "eval_count": 3}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with patch.object(agent, "_get_client", side_effect=AssertionError("Claude client used")), \
+         patch("urllib.request.urlopen", return_value=_Resp()) as opened:
+        session = agent.CallSession(call_id="c1", caller_number="+977", tenant=cfg)
+        assert agent.respond(session, "नमस्ते") == "नमस्ते"
+
+    body = json.loads(opened.call_args.args[0].data)
+    assert body["format"]["properties"]["lead_update"]["additionalProperties"] is False
+    assert session.usage_totals["input_tokens"] == 7
+    assert session.cost_usd == 0.0                     # a local model has no per-token price
+
+
+# ---------------------------------------------------------------- canned answers
+
+def test_canned_answer_skips_the_model_and_uses_the_tenants_own_wording():
+    cfg = tenants.TenantConfig(tenant_id="d4029493", company_name="Hamro G&G")
+    session = agent.CallSession(call_id="c1", tenant=cfg)
+    with patch.object(agent, "_get_client", side_effect=AssertionError("model called")):
+        say = agent.respond(session, "हजुर तपाईंको लोकेसन कहाँ होला?")
+    assert say == "हाम्रो सोरुम गोठाटारमा, पहिलो पुल नजिकै छ।"
+
+
+def test_canned_answer_records_a_parseable_turn_in_history():
+    cfg = tenants.TenantConfig(tenant_id="d4029493", company_name="Hamro G&G")
+    session = agent.CallSession(call_id="c1", tenant=cfg)
+    with patch.object(agent, "_get_client", side_effect=AssertionError("model called")):
+        agent.respond(session, "तपाईंको ठाउँ कहाँ हो?")
+
+    assert session.messages[-2] == {"role": "user", "content": "तपाईंको ठाउँ कहाँ हो?"}
+    say, lead_update, end_call = agent._parse_envelope(session.messages[-1]["content"])
+    assert say == "हाम्रो सोरुम गोठाटारमा, पहिलो पुल नजिकै छ।"
+    assert lead_update == {}
+    assert end_call is False
+
+
+def test_canned_answer_is_scoped_to_its_own_tenant():
+    # Same question, a DIFFERENT tenant — must not get Hamro G&G's address.
+    # This is the one regression that actually matters here: leaking one
+    # tenant's real-world address into another tenant's calls.
+    cfg = tenants.TenantConfig(tenant_id="some-other-tenant", company_name="Acme")
+    session = agent.CallSession(call_id="c1", tenant=cfg)
+    envelope = {"say": "model answered instead", "lead_update": {}, "end_call": False}
+    with patch.object(agent, "_get_client") as get_client:
+        get_client.return_value.messages.create.return_value = _fake_response(envelope)
+        say = agent.respond(session, "हजुर तपाईंको लोकेसन कहाँ होला?")
+    assert say == "model answered instead"
+
+
+def test_unrelated_questions_still_go_to_the_model():
+    cfg = tenants.TenantConfig(tenant_id="d4029493", company_name="Hamro G&G")
+    session = agent.CallSession(call_id="c1", tenant=cfg)
+    envelope = {"say": "स्कुटर उपलब्ध छ", "lead_update": {}, "end_call": False}
+    with patch.object(agent, "_get_client") as get_client:
+        get_client.return_value.messages.create.return_value = _fake_response(envelope)
+        say = agent.respond(session, "के तपाईंसँग स्कुटर छ?")
+    assert say == "स्कुटर उपलब्ध छ"

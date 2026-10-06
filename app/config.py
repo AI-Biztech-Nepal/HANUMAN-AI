@@ -7,6 +7,22 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Haiku keeps per-call cost ~5x lower than Sonnet — the margin of the business.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+# Which brain answers a turn: "claude" (hosted) or "ollama" (local, no API key).
+# The agent is written against both so the choice stays a measurement rather
+# than a commitment — see tools/llm_bakeoff.py for how a candidate is scored.
+# Local models are only worth switching to once one actually passes that bar.
+LLM_BACKEND = os.getenv("LLM_BACKEND", "claude").strip().lower()
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+# Generous by default: a cold local model pays a multi-GB load on the first
+# turn, and on CPU a single turn can take a minute. A phone call cannot wait
+# this long — the timeout is a backstop, not a target.
+OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "300"))
+# How long Ollama keeps the model in RAM after a turn. Its own default is 5
+# minutes; a caller pausing to think longer than that pays a multi-second
+# reload on the next turn, which on CPU is the slowest part of the call.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 COMPANY_NAME = os.getenv("COMPANY_NAME", "Your Company")

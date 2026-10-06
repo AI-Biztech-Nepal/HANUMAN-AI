@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 
 import anthropic
@@ -44,6 +46,11 @@ PRICING = {
     "haiku": (1.00, 5.00, 1.25, 0.10),
     "sonnet": (3.00, 15.00, 3.75, 0.30),
 }
+
+
+def active_model() -> str:
+    """Whichever brain answers a turn — see config.LLM_BACKEND."""
+    return config.OLLAMA_MODEL if config.LLM_BACKEND == "ollama" else config.CLAUDE_MODEL
 
 
 def estimate_cost_usd(usage: dict, model: str) -> float:
@@ -102,7 +109,11 @@ class CallSession:
 
     @property
     def cost_usd(self) -> float:
-        return estimate_cost_usd(self.usage_totals, config.CLAUDE_MODEL)
+        # The model that actually answered, not the configured Claude one: a
+        # local backend has no per-token price, and billing its tokens at
+        # Haiku's rates would overstate cost per call — the number every
+        # roadmap phase gate is measured on.
+        return estimate_cost_usd(self.usage_totals, active_model())
 
 
 # ---------------------------------------------------------------- prompts
@@ -195,8 +206,48 @@ def greeting(session: CallSession) -> str:
     return line
 
 
+# Tenants with a canonical answer worth short-circuiting the model for:
+# {tenant_id: {intent_keywords: exact recorded-line text}}.
+#
+# Small local models do not reliably recite an exact sentence, even one
+# they were just handed as fact — measured on gemma3:4b, asked "तपाईंको
+# लोकेसन कहाँ होला?" ("where is YOUR location"), it answered by asking the
+# CALLER for their own address instead. That is not a phrasing problem to
+# prompt-engineer around; it is the model losing track of whose location
+# was asked about. For a handful of guaranteed-frequent, guaranteed-true
+# questions, answering directly is both more correct and lets the tenant's
+# trained/recorded voice speak the reply verbatim instead of the
+# synthesized fallback.
+#
+# Deliberately keyed by tenant_id, not applied platform-wide: the answer
+# text is one tenant's real address, recorded in that tenant's own voice.
+# Every other tenant on this deployment must keep going through the model —
+# see CLAUDE.md "Every data query MUST be tenant-scoped."
+_CANNED_ANSWERS: dict[str, list[tuple[tuple[str, ...], str]]] = {
+    "d4029493": [  # Hamro G&G Auto Enterprises
+        (("लोकेसन", "ठाउँ", "कहाँ"), "हाम्रो सोरुम गोठाटारमा, पहिलो पुल नजिकै छ।"),
+    ],
+}
+
+
+def _canned_answer(session: CallSession, user_text: str) -> str | None:
+    for keywords, say in _CANNED_ANSWERS.get(session.tenant.tenant_id, []):
+        if any(k in user_text for k in keywords):
+            return say
+    return None
+
+
 def respond(session: CallSession, user_text: str) -> str:
     """Process one caller utterance, return what the agent should say."""
+    say = _canned_answer(session, user_text)
+    if say is not None:
+        # Same bookkeeping _turn() would do, minus the model call: the
+        # transcript still needs the caller's turn and a parseable assistant
+        # envelope, or the next real turn answers a question it never saw.
+        session.messages.append({"role": "user", "content": user_text})
+        session.messages.append({"role": "assistant", "content": json.dumps(
+            {"say": say, "lead_update": {}, "end_call": False}, ensure_ascii=False)})
+        return say
     return _turn(session, user_text=user_text)
 
 
@@ -231,30 +282,106 @@ def _connect_message(session: CallSession) -> str:
             "for a phone number in short pieces if you need one. Greet the caller.]")
 
 
+# ------------------------------------------------------- model backends
+
+# The reply envelope, as a schema. Claude and Ollama both accept one, and a
+# forced schema is what makes a local model usable at all: qwen3:8b emitted the
+# envelope 0% of the time when merely asked for it in the prompt, and 100% of
+# the time under a schema.
+#
+# lead_update is built from the tenant's own lead_fields rather than left as a
+# free-form object, for two reasons. Claude's structured outputs reject any
+# object without additionalProperties: false. And a small local model handed an
+# open object invents keys ("type", "action", "question") and never fills the
+# real ones — gemma3:4b captured 0 of 4 fields that way.
+def _envelope_schema(t: TenantConfig) -> dict:
+    lead_props = {
+        f: {"type": "boolean"} if f == "qualified" else {"type": "string"}
+        for f in t.lead_fields
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "say": {"type": "string"},
+            "lead_update": {
+                "type": "object",
+                "properties": lead_props,
+                "additionalProperties": False,
+            },
+            "end_call": {"type": "boolean"},
+        },
+        "required": ["say", "lead_update", "end_call"],
+        "additionalProperties": False,
+    }
+
+
+def _call_claude(t: TenantConfig, messages: list[dict]) -> tuple[str, dict]:
+    """A turn from the hosted model. Returns (raw envelope text, usage)."""
+    response = _get_client().messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=500,
+        system=_system_blocks(t),
+        messages=messages,
+        output_config={"format": {"type": "json_schema", "schema": _envelope_schema(t)}},
+    )
+    u = response.usage
+    return response.content[0].text, {
+        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+        "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+    }
+
+
+def _call_ollama(t: TenantConfig, messages: list[dict]) -> tuple[str, dict]:
+    """A turn from a local model — no API key, nothing leaves the machine.
+
+    Ollama takes the schema bare where Claude wraps it, and the cached/uncached
+    split has no meaning here, so those counters stay zero and estimate_cost_usd
+    reports $0 for a model it has no rates for.
+    """
+    body = json.dumps({
+        "model": config.OLLAMA_MODEL,
+        # One string, not cache-annotated blocks: local inference has no prefix cache.
+        "system": "\n\n".join(b["text"] for b in _system_blocks(t)),
+        "messages": messages,
+        "stream": False,
+        "think": False,          # reasoning models otherwise spend the budget thinking
+        "keep_alive": config.OLLAMA_KEEP_ALIVE,
+        "format": _envelope_schema(t),
+        "options": {"temperature": 0.3, "num_predict": 500},
+    }).encode()
+    req = urllib.request.Request(
+        config.OLLAMA_URL.rstrip("/") + "/api/chat",
+        data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=config.OLLAMA_TIMEOUT_S) as r:
+        data = json.loads(r.read())
+    raw = (data.get("message") or {}).get("content", "")
+    return raw, {
+        "input_tokens": data.get("prompt_eval_count", 0) or 0,
+        "output_tokens": data.get("eval_count", 0) or 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+
+def _call_model(t: TenantConfig, messages: list[dict]) -> tuple[str, dict]:
+    if config.LLM_BACKEND == "ollama":
+        return _call_ollama(t, messages)
+    return _call_claude(t, messages)
+
+
 def _turn(session: CallSession, user_text: str | None) -> str:
     if user_text is not None:
         session.messages.append({"role": "user", "content": user_text})
     elif not session.messages:
         session.messages.append({"role": "user", "content": _connect_message(session)})
 
-    response = _get_client().messages.create(
-        model=config.CLAUDE_MODEL,
-        max_tokens=500,
-        system=_system_blocks(session.tenant),
-        messages=session.messages,
-    )
-    raw = response.content[0].text
+    raw, usage = _call_model(session.tenant, session.messages)
     session.messages.append({"role": "assistant", "content": raw})
 
-    usage = response.usage
-    session.usage_totals["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-    session.usage_totals["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
-    session.usage_totals["cache_creation_input_tokens"] += (
-        getattr(usage, "cache_creation_input_tokens", 0) or 0
-    )
-    session.usage_totals["cache_read_input_tokens"] += (
-        getattr(usage, "cache_read_input_tokens", 0) or 0
-    )
+    for k, v in usage.items():
+        session.usage_totals[k] += v
 
     say, lead_update, end_call = _parse_envelope(raw)
     _apply_lead_update(session, lead_update)

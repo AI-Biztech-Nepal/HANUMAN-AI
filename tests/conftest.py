@@ -9,6 +9,10 @@ def tmp_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test_leads.db"
     monkeypatch.setattr(config, "LEADS_DB_PATH", str(db_path))
     monkeypatch.setattr(config, "ADMIN_API_KEY", "test-admin-key")
+    # Tests mock the Claude client, so they must not inherit whatever brain the
+    # developer's .env selects — LLM_BACKEND=ollama would send them to a real
+    # local server. A test that wants the local backend sets it itself.
+    monkeypatch.setattr(config, "LLM_BACKEND", "claude")
     yield db_path
 
 
