@@ -80,6 +80,16 @@ def model_for(voice_key: str) -> str | None:
     return str(v.model) if v and v.trained else None
 
 
+def _has_reference(voice_key: str) -> bool:
+    """Whether there is a recording of this voice to convert toward.
+
+    A voice with none cannot be converted, so loading the converter for it —
+    the slowest model to load, well over a minute cold — only delays a reply
+    that then falls back to the base voice anyway.
+    """
+    return bool(voice_key) and (REFS / f"{voice_key}_ref.wav").exists()
+
+
 def warmup(voice_key: str = "") -> None:
     """Load the converter, and one voice's embedding, ahead of the first call.
 
@@ -88,8 +98,12 @@ def warmup(voice_key: str = "") -> None:
     spoken reply reads as a hung call, so the portal triggers this when it
     checks voice status at sign-in. Safe to call repeatedly; never raises.
     """
+    if not _has_reference(voice_key):
+        if voice_key:
+            log.info("no reference recording for %r; it will speak in the base voice", voice_key)
+        return
     conv = _get_converter()
-    if conv is None or not voice_key:
+    if conv is None:
         return
     try:
         _target_se(conv, voice_key)
@@ -281,8 +295,10 @@ def status() -> dict:
 def convert(wav_bytes: bytes, voice_key: str) -> bytes:
     """Re-timbre Piper WAV bytes to `voice_key`. Returns the input unchanged
     if conversion is unavailable or fails — never raises into call handling."""
+    if not _has_reference(voice_key):
+        return wav_bytes
     conv = _get_converter()
-    if conv is None or not voice_key:
+    if conv is None:
         return wav_bytes
     src = dst = None
     try:

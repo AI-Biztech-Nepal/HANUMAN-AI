@@ -90,6 +90,45 @@ def test_voice_status_accepts_a_tenant_api_key_too():
     assert r.status_code == 200
 
 
+def test_voice_status_warms_the_agents_voice_for_a_tenant_key(monkeypatch):
+    # The tone converter is the slowest model to load. It is warmed for the
+    # agent this tenant will actually hear — by key as well as by cookie.
+    import app.main as main
+
+    asked = []
+
+    def fake_to_thread(fn, *args, **kwargs):
+        asked.append((fn, args))
+
+        async def run():
+            return fn(*args, **kwargs)
+        return run()
+
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(voice, "status", lambda: {"available": True})
+    monkeypatch.setattr(voice, "warmup", lambda *a, **k: None)
+
+    cfg = tenants.create(company_name="Sagar Motors", agent_name="Saagar")
+    r = _client().get("/portal/voice-status", headers={"X-Tenant-Key": cfg.api_key})
+    assert r.status_code == 200
+    assert (voice.warmup, ("sagar",)) in asked      # the misspelling still finds him
+
+
+def test_a_voice_with_no_reference_never_loads_the_converter(monkeypatch):
+    # An agent whose voice recording is gone (or not made yet) speaks in the base
+    # voice. Loading the converter for it would cost the first reply well over a
+    # minute and then change nothing.
+    from app import tone
+
+    def boom():
+        raise AssertionError("converter loaded for a voice with no reference")
+
+    monkeypatch.setattr(tone, "_get_converter", boom)
+    assert tone.convert(b"RIFFdata", "nobody-recorded-this") == b"RIFFdata"
+    tone.warmup("nobody-recorded-this")            # must not raise, must not load
+    tone.warmup("")
+
+
 def test_voice_websocket_refuses_an_unauthenticated_caller():
     c = _client()
     with c.websocket_connect("/portal/ws/voice") as ws:

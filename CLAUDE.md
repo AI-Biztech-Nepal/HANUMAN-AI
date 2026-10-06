@@ -7,7 +7,10 @@ qualifies leads, serves many customer companies from one deployment.
 
 ```bash
 # run server (needs ANTHROPIC_API_KEY + ADMIN_API_KEY in .env)
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload     # text only on Windows: piper lives in WSL
+
+# run server WITH voice (mic in the portal) — dev machine is Windows + WSL
+serve_voice.cmd                   # serves from .venv-wsl on the same port 8000
 
 # simulated call in terminal (no telephony)
 python test_call.py [tenant_id]

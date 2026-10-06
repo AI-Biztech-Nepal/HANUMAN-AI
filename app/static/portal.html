@@ -396,6 +396,7 @@
         <button class="small ghost" onclick="startChat()">↻ New test call</button>
       </div>
     </div>
+    <div class="card-sub" id="voiceNote" style="display:none"></div>
     <div id="chatLog"></div>
     <div id="voiceBar" style="display:none">
       <div class="mic-wrap"><div class="mic-ring" id="micRing"></div><div class="mic">🎙</div></div>
@@ -974,15 +975,30 @@ function cleanupVoice() {
 }
 
 async function checkVoice() {
+  // Hide the button rather than offer one that cannot work: voice needs
+  // piper + whisper on the host actually serving this page. But always say
+  // why — a mic button that is simply absent looks exactly like a broken
+  // page, and leaves nothing on screen to act on.
+  const note = msg => {
+    $('voiceNote').textContent = msg;
+    $('voiceNote').style.display = msg ? '' : 'none';
+  };
   try {
     const s = await api('/portal/voice-status');
-    // Hide the button rather than offer one that cannot work: voice needs
-    // piper + whisper on the host actually serving this page.
-    if (s.available && navigator.mediaDevices && window.MediaRecorder) {
+    if (!s.available) {
+      note('🎙 Voice calls are off on this server — '
+         + (s.reason || 'it cannot run speech') + '. Text chat still works.');
+    } else if (!navigator.mediaDevices || !window.MediaRecorder) {
+      note('🎙 This browser cannot record audio, so voice calls are off here. '
+         + 'Text chat still works.');
+    } else {
       $('voiceBtn').style.display = '';
       $('voiceBtn').title = 'Speech model: ' + (s.stt_model || '');
+      note('');
     }
-  } catch(e) { /* leave the button hidden */ }
+  } catch(e) {
+    note('🎙 Could not check whether voice is available — ' + (e.message || e));
+  }
 }
 
 // auto-login if key saved

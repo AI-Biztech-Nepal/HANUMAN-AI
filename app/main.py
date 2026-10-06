@@ -750,15 +750,17 @@ async def portal_voice_status(
 ):
     """Whether this host can run an in-browser voice call, so the portal can
     hide the mic rather than offer a button that cannot work."""
-    _require_tenant(x_tenant_key, session)
+    cfg = _require_tenant(x_tenant_key, session)
     state = await asyncio.to_thread(voice.status)
     if state.get("available"):
         # Load the models now, in the background, so the first spoken turn
         # doesn't pay for it. Deliberately not awaited. Passing this tenant's
         # voice warms the tone converter for the agent they will actually
-        # hear, rather than only the models shared by everyone.
-        cfg = _tenant_for_session(session) if session else None
-        agent_voice = tone.voice_key_for(cfg.agent_name) if cfg else ""
+        # hear, rather than only the models shared by everyone. cfg comes from
+        # whichever door authenticated — a tenant key warms it as well as a
+        # cookie does; deriving it from the cookie alone skipped the converter
+        # (the slowest model to load) for every key-authenticated caller.
+        agent_voice = tone.voice_key_for(cfg.agent_name)
         asyncio.create_task(asyncio.to_thread(voice.warmup, agent_voice or ""))
     return state
 

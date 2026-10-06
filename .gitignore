@@ -19,3 +19,15 @@ voice_prompts_batches.txt
 # Generated voice samples — rebuild with tools/nepali_voice.py
 samples*/
 samples_*.wav
+
+# Training checkpoints and the downloaded base model: hundreds of MB to a
+# few GB each, reproducible from voice_dataset_*/ + the public base
+# checkpoint, never worth a git push. tools/run_train.py / run_export.py
+# (the training/export scripts themselves) are plain text and still tracked.
+voice_training/base/
+voice_training/*/lightning_logs/
+voice_training/*/cache/
+voice_training/*.onnx
+voice_training/*.onnx.json
+voice_training/*.ckpt
+voice_training/*.wav

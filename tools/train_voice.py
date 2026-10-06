@@ -24,7 +24,11 @@ the fact. Checking costs seconds and is the only cheap moment to find out.
 from __future__ import annotations
 
 import argparse
+import array
+import hashlib
 import math
+import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -42,13 +46,25 @@ from tools import voices
 #   speech from one speaker. Less than that and the model keeps the base
 #   voice's character where the data is thin, which is heard as the voice
 #   drifting mid-sentence.
-# PEAK_DBFS_*: recorded level. Too quiet and the noise floor gets amplified
-#   along with the voice during normalisation; too hot and the clipping is
-#   baked in and trains as part of the timbre.
+# PEAK_DBFS_*: how loud a take may be recorded. The ceiling is clipping, which
+#   is baked in and trains as part of the timbre. The floor is not about noise —
+#   it is about the boost needed to bring the clip up to PEAK_TARGET_DBFS, which
+#   past a point lifts artefacts along with the voice. It is drawn from the two
+#   populations actually recorded: the Sagar take that had to be thrown away
+#   peaked at -28..-23 dBFS, and the one that was usable at -17..-5. -20 sits
+#   between them with about 3 dB either side. (A speech-to-noise gate was tried
+#   and rejected: it scored the discarded take at 62 dB and the usable one at
+#   74, because a laptop mic's noise suppression silences the pauses and makes
+#   every take look clean.)
+# PEAK_TARGET_DBFS: piper.train does no level normalisation — it loads the wav
+#   as-is and computes the spectrogram from the raw amplitude — so a quiet
+#   dataset is genuinely mismatched with the base voice it fine-tunes from.
+#   prepare_audio() therefore trains on level-matched copies.
 MIN_MINUTES = 20.0
 WARN_MINUTES = 30.0
-PEAK_DBFS_MIN = -12.0
+PEAK_DBFS_MIN = -20.0
 PEAK_DBFS_MAX = -1.0
+PEAK_TARGET_DBFS = -3.0
 SAMPLE_RATE = 22050
 
 # espeak-ng's Nepali voice: the phonemiser, not the speaker. The prompts in
@@ -81,10 +97,11 @@ def check(voice) -> bool:
         return False
 
     total = 0.0
-    quiet, hot, wrong_format = [], [], []
+    quiet, hot, wrong_format, peaks = [], [], [], []
     for w in clips:
         pk, secs = _peak_dbfs(w)
         total += secs
+        peaks.append(pk)
         if pk < PEAK_DBFS_MIN:
             quiet.append((w.name, pk))
         elif pk > PEAK_DBFS_MAX:
@@ -99,6 +116,12 @@ def check(voice) -> bool:
     print(f"audio:     {minutes:.1f} min  (floor {MIN_MINUTES:.0f}, "
           f"comfortable {WARN_MINUTES:.0f})")
     print(f"metadata:  {'ok' if voice.metadata.exists() else 'MISSING'}")
+    finite = [pk for pk in peaks if math.isfinite(pk)]
+    if finite:
+        lo, hi = PEAK_TARGET_DBFS - max(finite), PEAK_TARGET_DBFS - min(finite)
+        print(f"levels:    peaks {min(finite):.1f}..{max(finite):.1f} dBFS "
+              f"(median {statistics.median(finite):.1f}); training uses copies "
+              f"levelled to {PEAK_TARGET_DBFS:.0f} dBFS, a boost of {lo:+.0f}..{hi:+.0f} dB")
 
     ok = True
     if minutes < MIN_MINUTES:
@@ -117,8 +140,9 @@ def check(voice) -> bool:
         worst = min(pk for _, pk in quiet)
         print(f"\nTOO QUIET ({len(quiet)}/{len(clips)} clips, worst {worst:.1f} dBFS) "
               f"— want peaks between {PEAK_DBFS_MIN:.0f} and {PEAK_DBFS_MAX:.0f}.")
-        print("  Move closer to the mic or raise its gain and re-record. "
-              "Normalising afterwards raises the room noise with the voice.")
+        print("  Move closer to the mic or raise its gain and re-record those. "
+              "Levelling a clip this quiet needs a boost large enough to lift "
+              "artefacts along with the voice.")
         ok = False
     if hot:
         print(f"\nCLIPPING ({len(hot)} clips) — lower the gain and re-record "
@@ -129,16 +153,68 @@ def check(voice) -> bool:
     return ok
 
 
+def prepare_audio(voice, out: Path) -> Path:
+    """Write level-matched copies of the recordings, for training to read.
+
+    Each clip is scaled so its peak lands at PEAK_TARGET_DBFS. The originals are
+    never touched, so a wrong target costs a rebuild rather than a re-recording.
+    """
+    dst = out / "audio"
+    if dst.exists():
+        shutil.rmtree(dst)                  # no orphans from clips since removed
+    dst.mkdir(parents=True)
+    for src in sorted(voice.wavs.glob("*.wav")):
+        with wave.open(str(src)) as f:
+            params, frames = f.getparams(), f.readframes(f.getnframes())
+        samples = array.array("h")
+        samples.frombytes(frames)
+        peak = max((abs(v) for v in samples), default=0)
+        gain = 1.0
+        if peak:
+            gain = 10 ** ((PEAK_TARGET_DBFS - 20 * math.log10(peak / 32768)) / 20)
+        scaled = array.array("h", (max(-32768, min(32767, round(v * gain))) for v in samples))
+        with wave.open(str(dst / src.name), "wb") as f:
+            f.setparams(params)
+            f.writeframes(scaled.tobytes())
+    return dst
+
+
+def reset_stale_cache(out: Path, audio_dir: Path) -> bool:
+    """Clear piper's cache if the audio behind it has changed. True if cleared.
+
+    piper.train keys its cache by row number and transcript, not by the audio,
+    so after re-recording or re-levelling a clip it would keep training on the
+    old tensors without saying so. The fingerprint is what the cache was built from.
+    """
+    cache = out / "cache"
+    h = hashlib.sha1(f"{PEAK_TARGET_DBFS}".encode())
+    for w in sorted(audio_dir.glob("*.wav")):
+        h.update(w.name.encode())
+        h.update(w.read_bytes())
+    fingerprint, marker = h.hexdigest(), cache / ".audio-fingerprint"
+    if cache.exists() and (not marker.exists() or marker.read_text() != fingerprint):
+        shutil.rmtree(cache)
+        cache.mkdir(parents=True)
+        marker.write_text(fingerprint)
+        return True
+    cache.mkdir(parents=True, exist_ok=True)
+    marker.write_text(fingerprint)
+    return False
+
+
 def train(voice, base: Path | None, epochs: int, batch_size: int) -> int:
     """Fine-tune a Piper model on this dataset via piper.train's Lightning CLI."""
     out = REPO / "voice_training" / voice.key
     out.mkdir(parents=True, exist_ok=True)
     config = out / "config.json"
+    audio_dir = prepare_audio(voice, out)
+    if reset_stale_cache(out, audio_dir):
+        print("audio changed since the last run — cleared piper's cache so it is rebuilt")
 
     cmd = [
         sys.executable, "-m", "piper.train", "fit",
         "--data.csv_path", str(voice.metadata),
-        "--data.audio_dir", str(voice.wavs),
+        "--data.audio_dir", str(audio_dir),
         "--data.cache_dir", str(out / "cache"),
         "--data.config_path", str(config),
         "--data.voice_name", voice.key,

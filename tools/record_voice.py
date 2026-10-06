@@ -8,9 +8,10 @@ writes the LJSpeech layout Piper's training expects:
       metadata.csv          # id|transcript|transcript
 
 Usage:
-    python tools/record_voice.py                       # start or resume
-    python tools/record_voice.py --prompts my.txt      # your own sentences
-    python tools/record_voice.py --status              # how much do I have?
+    python tools/record_voice.py                              # start or resume
+    python tools/record_voice.py --prompts my.txt             # your own sentences
+    python tools/record_voice.py --device "Microphone Array"  # pin the laptop mic
+    python tools/record_voice.py --status                     # how much do I have?
 
 It resumes: already-recorded prompts are skipped, so you can stop any time
 and pick up later. After each take you can keep it, redo it, or skip the
@@ -41,6 +42,14 @@ SILENCE_HOLD_S = 0.9          # quiet for this long ends a take
 RMS_SPEECH = 450              # out of 32768, matching the call pipeline's VAD
 MAX_TAKE_S = 20.0
 LEAD_IN_S = 0.25              # keep a little room before the first word
+
+# The level a take has to land in is whatever the trainer will accept, taken
+# from it rather than copied: train_voice.py marks a dataset NOT ready if any
+# single clip peaks below PEAK_DBFS_MIN, so a recorder that warns at a looser
+# number lets a whole session pass here and fail there. (It did: the gate was
+# -18 while the trainer's was -12, and 3 of Sagar's first 5 takes fell between.)
+from tools.train_voice import PEAK_DBFS_MAX as PEAK_HOT_DBFS
+from tools.train_voice import PEAK_DBFS_MIN as PEAK_QUIET_DBFS
 
 DEFAULT_PROMPTS = REPO / "tools" / "prompts_ne.txt"
 
@@ -87,6 +96,34 @@ def report(prompts: list[str]) -> None:
               f"voice, and more is better.")
     else:
         print("That is enough to attempt a fine-tune.")
+
+
+def select_input(sd, spec: str | None) -> str:
+    """Point sounddevice at the requested microphone and return its name.
+
+    With no spec the system default is used, and that can change underneath a
+    session: a paired phone connecting over Bluetooth hands-free becomes the
+    default input at 16 kHz, and part of the dataset would silently be
+    phone-quality audio. --device pins the mic by index or by a name fragment.
+    """
+    inputs = [(i, d) for i, d in enumerate(sd.query_devices())
+              if d["max_input_channels"] > 0]
+    if spec:
+        if spec.isdigit():
+            found = [(i, d) for i, d in inputs if i == int(spec)]
+        else:
+            found = [(i, d) for i, d in inputs if spec.lower() in d["name"].lower()]
+        if not found:
+            names = chr(10).join(f"  [{i}] {d['name']}" for i, d in inputs)
+            sys.exit(f"no input device matches {spec!r}. Inputs:" + chr(10) + names)
+        sd.default.device = (found[0][0], None)
+    dev = sd.query_devices(kind="input")
+    if "hands-free" in dev["name"].lower() or dev["default_samplerate"] < SAMPLE_RATE:
+        print(f"WARNING: {dev['name']!r} is a phone-quality input "
+              f"({int(dev['default_samplerate'])} Hz) - the model trains at "
+              f"{SAMPLE_RATE} Hz. Pin the real mic with --device.")
+        print()
+    return f"{dev['name']} ({int(dev['default_samplerate'])} Hz native)"
 
 
 def record_take(sd, np):
@@ -145,6 +182,9 @@ def main() -> int:
                     help=f"which agent's voice ({', '.join(sorted(voices.VOICES))})")
     ap.add_argument("--prompts", type=Path, default=DEFAULT_PROMPTS)
     ap.add_argument("--status", action="store_true", help="show progress and exit")
+    ap.add_argument("--device", default=None,
+                    help="microphone: an index or part of its name, e.g. "
+                         "\"Microphone Array\" (default: the system default)")
     args = ap.parse_args()
 
     voice = voices.get(args.voice)
@@ -161,6 +201,8 @@ def main() -> int:
         import sounddevice as sd
     except ImportError as exc:
         sys.exit(f"needs sounddevice and numpy: {exc}")
+    print(f"mic  : {select_input(sd, args.device)}")
+    print()
 
     done = load_done()
     todo = [(f"{i + 1:04d}", t) for i, t in enumerate(prompts)
@@ -197,10 +239,12 @@ def main() -> int:
             secs = len(audio) / SAMPLE_RATE
             peak = peak_dbfs(audio, np)
             warn = ""
-            if peak > -1.0:
+            if peak > PEAK_HOT_DBFS:
                 warn = "  ⚠ too loud, likely clipped — move back from the mic"
-            elif peak < -30.0:
-                warn = "  ⚠ very quiet — move closer or raise the input gain"
+            elif peak < PEAK_QUIET_DBFS:
+                warn = (f"  ⚠ too quiet at {peak:.0f} dBFS — raise the input gain "
+                        f"or move closer, then redo. Do not record a whole "
+                        f"session this quiet.")
             print(f"      {secs:.1f}s, peak {peak:.0f} dBFS{warn}")
 
             choice = input("      k=keep  r=redo  s=skip  q=quit: ").strip().lower()
